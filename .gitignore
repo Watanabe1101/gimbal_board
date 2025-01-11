@@ -1,0 +1,20 @@
+# Build artifacts
+build/
+.pioenvs/
+idf.py
+CMakeFiles/
+CMakeCache.txt
+img/
+
+# IDE specific files
+.vscode/
+.idea/
+
+# Other temporary files
+*.o
+*.elf
+*.bin
+*.map
+*.log
+*.cmd
+*.txt  # Build logs and other temporary text files
