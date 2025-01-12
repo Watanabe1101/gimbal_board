@@ -1,220 +1,149 @@
-#include "SPICREATE.h"
-
-static const char *TAG_SPICREATE = "SPICreate";
-
-//-------------------------------------------
-// コールバック関数 (CS制御用)
-//-------------------------------------------
-void IRAM_ATTR csReset(spi_transaction_t *t)
+// version: 2.0.0
+#include "SPICREATE.h" // 2.0.0
+void csSet(spi_transaction_t *t)
 {
-    // t->user にデバイス追加時に設定した csPin が格納されている想定
-    gpio_num_t csPin = (gpio_num_t)(uint32_t)(t->user);
-    gpio_set_level(csPin, 0);
+    digitalWrite((int)t->user, HIGH);
+    return;
+}
+void csReset(spi_transaction_t *t)
+{
+    digitalWrite((int)t->user, LOW);
+    return;
 }
 
-void IRAM_ATTR csSet(spi_transaction_t *t)
+bool SPICreate::begin(uint8_t spi_bus, int8_t sck, int8_t miso, int8_t mosi, uint32_t f)
 {
-    gpio_num_t csPin = (gpio_num_t)(uint32_t)(t->user);
-    gpio_set_level(csPin, 1);
-}
 
-//-------------------------------------------
-// SPICreate 実装
-//-------------------------------------------
-SPICreate::SPICreate()
-{
-    _host = (spi_host_device_t)-1;
-    _initialized = false;
-}
-
-SPICreate::~SPICreate()
-{
-    // end()を呼ばずにデストラクタが呼ばれたら、あとでend()を呼ぶ
-    if (_initialized)
+    frequency = f;
+    if ((sck == -1) && (miso == -1) && (mosi == -1))
     {
-        end();
-    }
-}
-
-esp_err_t SPICreate::begin(spi_host_device_t host,
-                           gpio_num_t sck,
-                           gpio_num_t miso,
-                           gpio_num_t mosi,
-                           uint32_t freq,
-                           int dma_chan)
-{
-    if (_initialized)
-    {
-        ESP_LOGW(TAG_SPICREATE, "SPI bus already initialized");
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    // GPIO設定 (SCK, MISO, MOSIピンをSPIとして使用)
-    // → spi_bus_initialize() 内部で自動的に設定されますが、
-    //   必要に応じて gpio_config() でPull設定などしておくとよい
-
-    // SPIバス設定
-    spi_bus_config_t buscfg = {};
-    buscfg.sclk_io_num = sck;
-    buscfg.miso_io_num = miso;
-    buscfg.mosi_io_num = mosi;
-    buscfg.quadwp_io_num = -1;  // 未使用なら -1
-    buscfg.quadhd_io_num = -1;  // 未使用なら -1
-    buscfg.max_transfer_sz = 4096; // 必要に応じて調整
-
-    // バス初期化
-    esp_err_t ret = spi_bus_initialize(host, &buscfg, dma_chan);
-    if (ret != ESP_OK)
-    {
-        ESP_LOGE(TAG_SPICREATE, "spi_bus_initialize failed: %s", esp_err_to_name(ret));
-        return ret;
-    }
-
-    _host = host;
-    _initialized = true;
-    ESP_LOGI(TAG_SPICREATE, "SPI bus initialized (host=%d, freq=%u)", host, freq);
-    return ESP_OK;
-}
-
-esp_err_t SPICreate::end()
-{
-    if (!_initialized)
-    {
-        return ESP_ERR_INVALID_STATE;
-    }
-    esp_err_t ret = spi_bus_free(_host);
-    if (ret == ESP_OK)
-    {
-        _initialized = false;
-        ESP_LOGI(TAG_SPICREATE, "SPI bus freed (host=%d)", _host);
+        bus_cfg.sclk_io_num = (spi_bus == VSPI) ? SCK : 14;
+        bus_cfg.miso_io_num = (spi_bus == VSPI) ? MISO : 12;
+        bus_cfg.mosi_io_num = (spi_bus == VSPI) ? MOSI : 13;
     }
     else
     {
-        ESP_LOGE(TAG_SPICREATE, "spi_bus_free failed: %s", esp_err_to_name(ret));
+        bus_cfg.sclk_io_num = sck;
+        bus_cfg.miso_io_num = miso;
+        bus_cfg.mosi_io_num = mosi;
     }
-    return ret;
-}
 
-spi_device_handle_t SPICreate::addDevice(const spi_device_interface_config_t *if_cfg,
-                                         gpio_num_t csPin)
-{
-    if (!_initialized)
+    bus_cfg.max_transfer_sz = max_size;
+
+    if ((mode != SPI_MODE1) && (mode != SPI_MODE3))
     {
-        ESP_LOGE(TAG_SPICREATE, "SPI bus not initialized");
-        return nullptr;
+        mode = SPI_MODE3;
     }
 
-    // CSピンのGPIO設定
-    gpio_config_t io_conf = {};
-    io_conf.pin_bit_mask = (1ULL << csPin);
-    io_conf.mode = GPIO_MODE_OUTPUT;
-    io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
-    io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
-    io_conf.intr_type = GPIO_INTR_DISABLE;
-    gpio_config(&io_conf);
-
-    // CSピンをデフォルトHIGHに
-    gpio_set_level(csPin, 1);
-
-    // デバイスインターフェース設定をコピーして user に csPin を設定
-    spi_device_interface_config_t devcfg = *if_cfg;
-    devcfg.spics_io_num = -1; // ハードウェアCSは使わず、ソフト制御する場合は -1
-    devcfg.pre_cb = (devcfg.pre_cb) ? devcfg.pre_cb : csReset;
-    devcfg.post_cb = (devcfg.post_cb) ? devcfg.post_cb : csSet;
-    devcfg.user = (void *)(uint32_t)csPin; // CSピン番号を記録
-
-    // デバイス追加
-    spi_device_handle_t handle = nullptr;
-    esp_err_t ret = spi_bus_add_device(_host, &devcfg, &handle);
-    if (ret != ESP_OK)
+    host = (spi_bus == HSPI) ? HSPI_HOST : VSPI_HOST;
+    dma_chan = 1;
+    if (spi_bus == VSPI)
     {
-        ESP_LOGE(TAG_SPICREATE, "spi_bus_add_device failed: %s", esp_err_to_name(ret));
-        return nullptr;
+        dma_chan = 1;
     }
-
-    ESP_LOGI(TAG_SPICREATE, "Device added (CS=%d)", csPin);
-    return handle;
-}
-
-esp_err_t SPICreate::removeDevice(spi_device_handle_t handle)
-{
-    if (!handle)
+    if (spi_bus == HSPI)
     {
-        return ESP_ERR_INVALID_ARG;
+        dma_chan = 2;
     }
-    esp_err_t ret = spi_bus_remove_device(handle);
-    if (ret != ESP_OK)
+    esp_err_t e = spi_bus_initialize(host, &bus_cfg, dma_chan);
+    if (e != ESP_OK)
     {
-        ESP_LOGE(TAG_SPICREATE, "spi_bus_remove_device failed: %s", esp_err_to_name(ret));
+        // printf("[ERROR] SPI bus initialize failed : %d\n", e);
+        return false;
     }
-    else
+
+    return true;
+}
+bool SPICreate::end()
+{
+    esp_err_t e = spi_bus_free(host);
+    if (e != ESP_OK)
     {
-        ESP_LOGI(TAG_SPICREATE, "Device removed");
+        // printf("[ERROR] SPI bus free failed : %d\n", e);
+        return false;
     }
-    return ret;
+
+    return true;
 }
-
-void SPICreate::sendCmd(uint8_t cmd, spi_device_handle_t handle)
+int SPICreate::addDevice(spi_device_interface_config_t *if_cfg, int cs)
 {
-    spi_transaction_t trans = {};
-    trans.flags = SPI_TRANS_USE_TXDATA;
-    trans.length = 8;    // 1 byte
-    trans.tx_data[0] = cmd;
-
-    pollTransmit(&trans, handle);
-}
-
-uint8_t SPICreate::readByte(uint8_t addr, spi_device_handle_t handle)
-{
-    // アドレス(8bit) + データ(8bit) の合計16bitを想定
-    spi_transaction_t trans = {};
-    trans.flags = SPI_TRANS_USE_TXDATA | SPI_TRANS_USE_RXDATA;
-    trans.length = 16;
-    trans.tx_data[0] = addr;
-
-    pollTransmit(&trans, handle);
-
-    return trans.rx_data[1]; // 上位8bit=tx_data(0)に被るので、受信データはrx_data[1]
-}
-
-void SPICreate::writeByte(uint8_t addr, uint8_t data, spi_device_handle_t handle)
-{
-    spi_transaction_t trans = {};
-    trans.flags = SPI_TRANS_USE_TXDATA;
-    trans.length = 16;
-    trans.tx_data[0] = addr;
-    trans.tx_data[1] = data;
-
-    transmit(&trans, handle);
-}
-
-void SPICreate::transmit(const uint8_t *tx, uint8_t *rx, size_t len, spi_device_handle_t handle)
-{
-    // 全二重 (txとrxが同時に送受信) を想定
-    spi_transaction_t trans = {};
-    memset(&trans, 0, sizeof(trans));
-    trans.length = len * 8;
-    trans.tx_buffer = tx;
-    trans.rx_buffer = rx;
-
-    transmit(&trans, handle);
-}
-
-void SPICreate::transmit(spi_transaction_t *trans, spi_device_handle_t handle)
-{
-    esp_err_t ret = spi_device_transmit(handle, trans);
-    if (ret != ESP_OK)
+    deviceNum++;
+    CSs[deviceNum] = cs;
+    pinMode(cs, OUTPUT);
+    digitalWrite(cs, HIGH);
+    if (deviceNum > 9)
     {
-        ESP_LOGE(TAG_SPICREATE, "spi_device_transmit failed: %s", esp_err_to_name(ret));
+        return 0;
     }
+    esp_err_t e = spi_bus_add_device(host, if_cfg, &handle[deviceNum]);
+    if (e != ESP_OK)
+    {
+        return 0;
+    }
+    return deviceNum;
 }
 
-void SPICreate::pollTransmit(spi_transaction_t *trans, spi_device_handle_t handle)
+bool SPICreate::rmDevice(int deviceHandle)
 {
-    // 割り込みを使わないポーリング送受信
-    esp_err_t ret = spi_device_polling_transmit(handle, trans);
-    if (ret != ESP_OK)
+    esp_err_t e = spi_bus_remove_device(handle[deviceHandle]);
+    if (e != ESP_OK)
     {
-        ESP_LOGE(TAG_SPICREATE, "spi_device_polling_transmit failed: %s", esp_err_to_name(ret));
+        // printf("[ERROR] SPI bus remove device failed : %d\n", e);
+        return false;
     }
+    return true;
+}
+void SPICreate::sendCmd(uint8_t cmd, int deviceHandle)
+{
+    spi_transaction_t comm = {};
+    comm.flags = SPI_TRANS_USE_TXDATA;
+    comm.length = 8;
+    comm.tx_data[0] = cmd;
+    comm.user = (void *)CSs[deviceHandle];
+    pollTransmit(&comm, deviceHandle);
+}
+uint8_t SPICreate::readByte(uint8_t addr, int deviceHandle)
+{
+    spi_transaction_t comm = {};
+    comm.flags = SPI_TRANS_USE_RXDATA | SPI_TRANS_USE_TXDATA;
+    comm.tx_data[0] = addr;
+    comm.length = 16;
+    comm.user = (void *)CSs[deviceHandle];
+    pollTransmit(&comm, deviceHandle);
+    return comm.rx_data[1];
+}
+void SPICreate::setReg(uint8_t addr, uint8_t data, int deviceHandle)
+{
+    spi_transaction_t comm = {};
+    comm.flags = SPI_TRANS_USE_TXDATA;
+    comm.length = 16;
+    comm.tx_data[0] = addr;
+    comm.tx_data[1] = data;
+    transmit(&comm, deviceHandle);
+}
+void SPICreate::transmit(uint8_t *tx, int size, int deviceHandle)
+{
+    transmit(tx, NULL, size, deviceHandle);
+}
+void SPICreate::transmit(uint8_t *tx, uint8_t *rx, int size, int deviceHandle)
+{
+    spi_transaction_t comm = {};
+    comm.length = size * 2 * 8;
+    comm.rxlength = size * 8;
+    comm.tx_buffer = tx;
+    comm.rx_buffer = rx;
+    transmit(&comm, deviceHandle);
+}
+
+void SPICreate::transmit(spi_transaction_t *transaction, int deviceHandle)
+{
+    digitalWrite(CSs[deviceHandle], LOW);
+    esp_err_t e = spi_device_transmit(handle[deviceHandle], transaction);
+    digitalWrite(CSs[deviceHandle], HIGH);
+    return;
+}
+void SPICreate::pollTransmit(spi_transaction_t *transaction, int deviceHandle)
+{
+    spi_device_polling_transmit(handle[deviceHandle], transaction);
+    return;
 }

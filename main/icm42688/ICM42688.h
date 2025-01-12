@@ -1,105 +1,84 @@
+// version: 1.0.0
 #pragma once
 
-#include <stdint.h>
-#include <string.h>
-#include "esp_log.h"
-#include "SPICREATE.h"
+#ifndef ICM_H
+#define ICM_H
+#include <SPICREATE.h> // 2.0.0
 
-// ICM42688のレジスタ定義例（実際のデータシートを参照してください）
-#define ICM42688_REG_POWER_MGMT    0x4E
-#define ICM42688_REG_WHO_AM_I      0x75
-#define ICM42688_REG_ACCEL_GYRO    0x1F  // 仮: 加速度・ジャイロ一括読み取り口
+#define POWER_MANAGEMENT 0x4E
+#define WHO_AM_I_Address 0x75
+#define ICM_Data_Adress 0x1F
 
-class ICM42688
+class ICM
 {
+    int CS;
+    int deviceHandle{-1};
+    SPICreate *ICMSPI;
+
 public:
-    ICM42688() : _spi(nullptr), _handle(nullptr) {}
-
-    /**
-     * @brief 初期化
-     * @param spi     SPICreate のインスタンス
-     * @param csPin   CSピン番号
-     * @param freq    SPI通信周波数(Hz)
-     */
-    esp_err_t begin(SPICreate *spi, gpio_num_t csPin, uint32_t freq)
-    {
-        if (!spi) return ESP_ERR_INVALID_ARG;
-        _spi = spi;
-
-        // spi_device_interface_config_t 設定
-        spi_device_interface_config_t devcfg = {};
-        devcfg.command_bits = 0;        // 可変コマンド位数の必要があれば設定
-        devcfg.address_bits = 0;        // 可変アドレス位数の必要があれば設定
-        devcfg.dummy_bits = 0;         // ダミーサイクル不要なら0
-        devcfg.mode = 0;               // CPOL=0, CPHA=0 => モード0
-        devcfg.clock_speed_hz = freq;  // 周波数
-        devcfg.spics_io_num = -1;      // ソフト制御のため -1
-        devcfg.queue_size = 1;         // キューサイズ
-        devcfg.pre_cb = csReset;       // コールバック(事前にcsPin LOW)
-        devcfg.post_cb = csSet;        // コールバック(後にcsPin HIGH)
-        // devcfg.flags = 0;           // 必要に応じて SPI_DEVICE_HALFDUPLEX等
-
-        // デバイス追加
-        _handle = _spi->addDevice(&devcfg, csPin);
-        if (!_handle)
-        {
-            ESP_LOGE(TAG, "Failed to add ICM42688 device");
-            return ESP_FAIL;
-        }
-
-        // 電源ONなど初期設定(例)
-        _spi->writeByte(ICM42688_REG_POWER_MGMT, 0x0F, _handle);
-
-        ESP_LOGI(TAG, "ICM42688 init done");
-        return ESP_OK;
-    }
-
-    /**
-     * @brief WHO_AM_I レジスタを読む
-     */
-    uint8_t whoAmI()
-    {
-        if (!_handle) return 0;
-        // ICM42688の読み出し時、上位bitに0x80をORする場合もある
-        // ここでは仮に 0x80付ける例とする
-        return _spi->readByte(ICM42688_REG_WHO_AM_I | 0x80, _handle);
-    }
-
-    /**
-     * @brief 加速度 & ジャイロ取得 (6軸分)
-     * @param[out] out  要素数6以上のint16_t配列
-     */
-    void getAccelGyro(int16_t *out)
-    {
-        if (!_handle) return;
-
-        // 例: 加速度XYZ + ジャイロXYZ = 6軸分(1軸あたり2バイト=>12バイト)
-        uint8_t rx_buf[12] = {0};
-        // 先頭1バイトをアドレスとして送る必要があるならば、transmitで対応
-        // or spi_transaction_ext_t を使う
-
-        // 簡単に全二重で 13バイト(アドレス1+データ12)やりとりする例
-        uint8_t tx_buf[13] = {0};
-        // 読みレジスタ(上位ビットセット)
-        tx_buf[0] = (ICM42688_REG_ACCEL_GYRO | 0x80);
-
-        // 全二重通信を使い、tx_buf[0]を送信しつつrx_bufに受信する
-        // ただし rx_buf[0] にはアドレス送信時のゴミが入るため
-        // データは rx_buf[1] から12バイト分になる
-        _spi->transmit(tx_buf, rx_buf, 13, _handle);
-
-        // rx_buf[1..12] = 12バイトがセンサデータ
-        out[0] = (int16_t)((rx_buf[1] << 8) | rx_buf[2]);
-        out[1] = (int16_t)((rx_buf[3] << 8) | rx_buf[4]);
-        out[2] = (int16_t)((rx_buf[5] << 8) | rx_buf[6]);
-        out[3] = (int16_t)((rx_buf[7] << 8) | rx_buf[8]);
-        out[4] = (int16_t)((rx_buf[9] << 8) | rx_buf[10]);
-        out[5] = (int16_t)((rx_buf[11] << 8) | rx_buf[12]);
-    }
-
-private:
-    static constexpr const char *TAG = "ICM42688";
-
-    SPICreate *_spi;
-    spi_device_handle_t _handle;
+    void begin(SPICreate *targetSPI, int cs, uint32_t freq = 8000000);
+    uint8_t WhoAmI();
+    uint8_t UserBank();
+    void Get(int16_t *rx);
 };
+
+void ICM::begin(SPICreate *targetSPI, int cs, uint32_t freq)
+{
+    CS = cs;
+    ICMSPI = targetSPI;
+    spi_device_interface_config_t if_cfg = {};
+
+    // if_cfg.spics_io_num = cs;
+    if_cfg.pre_cb = NULL;
+    if_cfg.post_cb = NULL;
+    if_cfg.cs_ena_pretrans = 0;
+    if_cfg.cs_ena_posttrans = 0;
+
+    if_cfg.clock_speed_hz = freq;
+
+    if_cfg.mode = SPI_MODE0; // 0 or 3
+    if_cfg.queue_size = 1;
+
+    if_cfg.pre_cb = csReset;
+    if_cfg.post_cb = csSet;
+
+    deviceHandle = ICMSPI->addDevice(&if_cfg, cs);
+
+    ICMSPI->setReg(POWER_MANAGEMENT, 0x0F, deviceHandle);
+    return;
+}
+uint8_t ICM::WhoAmI()
+{
+    return ICMSPI->readByte(0x80 | WHO_AM_I_Address, deviceHandle);
+}
+
+/**
+ * @fn
+ * ICMから加速度、角速度を取得
+ */
+void ICM::Get(int16_t *rx)
+{
+    uint8_t rx_buf[12];
+    spi_transaction_t comm = {};
+    comm.flags = SPI_TRANS_VARIABLE_CMD | SPI_TRANS_VARIABLE_ADDR;
+    comm.length = (12) * 8;
+    comm.cmd = ICM_Data_Adress | 0x80;
+
+    comm.tx_buffer = NULL;
+    comm.rx_buffer = rx_buf;
+    comm.user = (void *)CS;
+
+    spi_transaction_ext_t spi_transaction = {};
+    spi_transaction.base = comm;
+    spi_transaction.command_bits = 8;
+    ICMSPI->pollTransmit((spi_transaction_t *)&spi_transaction, deviceHandle);
+
+    rx[0] = (rx_buf[0] << 8 | rx_buf[1]);
+    rx[1] = (rx_buf[2] << 8 | rx_buf[3]);
+    rx[2] = (rx_buf[4] << 8 | rx_buf[5]);
+    rx[3] = (rx_buf[6] << 8 | rx_buf[7]);
+    rx[4] = (rx_buf[8] << 8 | rx_buf[9]);
+    rx[5] = (rx_buf[10] << 8 | rx_buf[11]);
+    return;
+}
+#endif

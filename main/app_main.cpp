@@ -12,9 +12,12 @@
 #include "foc/esp_foc.h"
 #include "svpwm/esp_svpwm.h"
 #include "esp_timer.h"
+#include "esp_system.h"
+#include "SPICREATE.h"
+#include "ICM42688.h"
 
 // static const char *TAG = "example_foc";
-static const char *TAG_IMU = "IMU";
+// static const char *TAG_IMU = "IMU";
 
 // //////////////////////////////////////////////////////////////////////////////////////////////////////////
 // ////////////// Please update the following configuration according to your HardWare spec /////////////////
@@ -56,9 +59,9 @@ static const char *TAG_IMU = "IMU";
 //     return task_yield;
 // }
 
-void app_main(void)
-{
-    esp_log_level_set("*", ESP_LOG_INFO);
+// void app_main(void)
+// {
+//     esp_log_level_set("*", ESP_LOG_INFO);
     // ESP_LOGI(TAG, "Hello FOC");
     // // counting semaphore used to sync update foc calculation when mcpwm timer updated
     // SemaphoreHandle_t update_semaphore = xSemaphoreCreateCounting(1, 0);
@@ -116,7 +119,7 @@ void app_main(void)
 
     // int foc_iteration_count = 0; // カウンタ初期化
 
-    while (true) {
+    // while (true) {
     //     xSemaphoreTake(update_semaphore, portMAX_DELAY);
 
     //     // 処理時間計測の開始
@@ -155,9 +158,46 @@ void app_main(void)
     //     if (foc_iteration_count % 100 == 0) {
     //         ESP_LOGI(TAG, "FOC iteration %d: Processing time = %lld us", foc_iteration_count, end_time - start_time);
     //     }
-    }
+    // }
 
     // bsp_bridge_driver_enable(false);
     // ESP_ERROR_CHECK(svpwm_inverter_start(inverter1, MCPWM_TIMER_STOP_EMPTY));
     // ESP_ERROR_CHECK(svpwm_del_inverter(inverter1));
+// }
+
+extern "C" void app_main(void)
+{
+    // SPIラッパークラスインスタンス
+    static SPICreate spi;
+    // SPI2_HOSTを使う例 (ESP32なら VSPI_HOST=SPI3_HOST, HSPI_HOST=SPI2_HOST など)
+    esp_err_t ret = spi.begin(
+        SPI2_HOST,
+        (gpio_num_t)10,   // SCLK
+        (gpio_num_t)13,   // MISO
+        (gpio_num_t)11,   // MOSI
+        8 * 1000 * 1000,  // 8MHz
+        SPI_DMA_CH_AUTO   // DMAを自動割り当て
+    );
+    if (ret != ESP_OK) {
+        printf("SPI begin failed: %s\n", esp_err_to_name(ret));
+        return;
+    }
+
+    // ICM42688インスタンス
+    static ICM42688 icm;
+    // CS=GPIO_NUM_9(例)、周波数=8MHz
+    icm.begin(&spi, (gpio_num_t)9, 8 * 1000 * 1000);
+
+    while (true) {
+        uint8_t id = icm.whoAmI();
+        printf("WHO_AM_I=0x%02X\n", id);
+
+        int16_t sensor[6] ={0};
+        icm.getAccelGyro(sensor);
+        printf("Accel: [%d, %d, %d], Gyro: [%d, %d, %d]\n",
+               sensor[0], sensor[1], sensor[2],
+               sensor[3], sensor[4], sensor[5]);
+
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
 }
