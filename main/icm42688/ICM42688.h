@@ -3,7 +3,7 @@
 
 #ifndef ICM_H
 #define ICM_H
-#include <SPICREATE.h> // 2.0.0
+#include "SPICREATE.h" // 2.0.0
 
 #define POWER_MANAGEMENT 0x4E
 #define WHO_AM_I_Address 0x75
@@ -36,7 +36,7 @@ void ICM::begin(SPICreate *targetSPI, int cs, uint32_t freq)
 
     if_cfg.clock_speed_hz = freq;
 
-    if_cfg.mode = SPI_MODE0; // 0 or 3
+    if_cfg.mode = 3; // 0 or 3
     if_cfg.queue_size = 1;
 
     if_cfg.pre_cb = csReset;

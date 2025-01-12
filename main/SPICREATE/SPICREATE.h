@@ -6,9 +6,7 @@
 
 #include <driver/spi_master.h>
 #include <deque>
-
-void csSet(spi_transaction_t *t);
-void csReset(spi_transaction_t *t);
+#include <esp_log.h>
 
 class SPICreate
 {
@@ -16,9 +14,9 @@ class SPICreate
     spi_device_handle_t handle[3];
     int CSs[3];
     int deviceNum{0};
-    spi_host_device_t host{HSPI_HOST};
-    uint8_t mode{SPI_MODE3}; // must be 1 or 3
-    int dma_chan{1};         // must be 1 or 2
+    spi_host_device_t host = SPI2_HOST;
+    uint8_t mode = 3; // must be 1 or 3
+    int dma_chan = 1;         // must be 1 or 2
     int max_size{4094};      // default size
     uint32_t frequency{SPI_MASTER_FREQ_8M};
 
@@ -26,7 +24,12 @@ class SPICreate
     int queue_size{1};
 
 public:
-    bool begin(uint8_t spi_bus = HSPI, int8_t sck = -1, int8_t miso = -1, int8_t mosi = -1, uint32_t f = 8000000);
+    bool begin(spi_host_device_t host_in = SPI2_HOST,
+               int sck = -1, 
+               int miso = -1, 
+               int mosi = -1, 
+               uint32_t f = SPI_MASTER_FREQ_8M);
+
     bool end();
 
     int addDevice(spi_device_interface_config_t *if_cfg, int cs);
