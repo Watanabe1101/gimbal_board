@@ -15,7 +15,6 @@ class SPICreate
     int deviceNum{0};
     spi_host_device_t host = SPI2_HOST;
     uint8_t mode = 3; // must be 1 or 3
-    int dma_chan = 1;         // must be 1 or 2
     int max_size{4094};      // default size
     uint32_t frequency{SPI_MASTER_FREQ_8M};
 

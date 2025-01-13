@@ -15,13 +15,8 @@ bool SPICreate::begin(spi_host_device_t host_in, int sck, int miso, int mosi, ui
     }
 
     host = host_in; 
-    if (host_in == SPI2_HOST) {
-        dma_chan = 1; // 例: SPI2はDMAチャンネル1を使う
-    } else if (host_in == SPI3_HOST) {
-        dma_chan = 2; 
-    }
 
-    esp_err_t e = spi_bus_initialize(host, &bus_cfg, dma_chan);
+    esp_err_t e = spi_bus_initialize(host, &bus_cfg, SPI_DMA_CH_AUTO);
     if (e != ESP_OK) {
         return false;
     }
