@@ -170,14 +170,14 @@ extern "C" void app_main(void)
     // SPIラッパークラスインスタンス
     static SPICreate spi;
     // SPI2_HOSTを使う例 (ESP32なら VSPI_HOST=SPI3_HOST, HSPI_HOST=SPI2_HOST など)
-    esp_err_t ret = spi.begin(
+    bool ret = spi.begin(
         SPI2_HOST,
         (gpio_num_t)6,   // SCLK
         (gpio_num_t)4,   // MISO
         (gpio_num_t)5,   // MOSI
         8 * 1000 * 1000 // 8MHz
     );
-    if (ret != ESP_OK) {
+    if (ret != true) {
         printf("SPI begin failed: %s\n", esp_err_to_name(ret));
         return;
     }

@@ -18,6 +18,7 @@ bool SPICreate::begin(spi_host_device_t host_in, int sck, int miso, int mosi, ui
 
     esp_err_t e = spi_bus_initialize(host, &bus_cfg, SPI_DMA_CH_AUTO);
     if (e != ESP_OK) {
+        ESP_LOGE("SPICreate", "SPI bus initialize failed : %d", e);
         return false;
     }
     return true;
