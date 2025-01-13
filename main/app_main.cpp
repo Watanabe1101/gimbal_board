@@ -172,11 +172,10 @@ extern "C" void app_main(void)
     // SPI2_HOSTを使う例 (ESP32なら VSPI_HOST=SPI3_HOST, HSPI_HOST=SPI2_HOST など)
     esp_err_t ret = spi.begin(
         SPI2_HOST,
-        (gpio_num_t)10,   // SCLK
-        (gpio_num_t)13,   // MISO
-        (gpio_num_t)11,   // MOSI
-        8 * 1000 * 1000,  // 8MHz
-        SPI_DMA_CH_AUTO   // DMAを自動割り当て
+        (gpio_num_t)6,   // SCLK
+        (gpio_num_t)4,   // MISO
+        (gpio_num_t)5,   // MOSI
+        8 * 1000 * 1000 // 8MHz
     );
     if (ret != ESP_OK) {
         printf("SPI begin failed: %s\n", esp_err_to_name(ret));
@@ -184,16 +183,16 @@ extern "C" void app_main(void)
     }
 
     // ICM42688インスタンス
-    static ICM42688 icm;
+    ICM icm;
     // CS=GPIO_NUM_9(例)、周波数=8MHz
-    icm.begin(&spi, (gpio_num_t)9, 8 * 1000 * 1000);
+    icm.begin(&spi, (gpio_num_t)40, 8 * 1000 * 1000);
 
     while (true) {
-        uint8_t id = icm.whoAmI();
+        uint8_t id = icm.WhoAmI();
         printf("WHO_AM_I=0x%02X\n", id);
 
         int16_t sensor[6] ={0};
-        icm.getAccelGyro(sensor);
+        icm.Get(sensor);
         printf("Accel: [%d, %d, %d], Gyro: [%d, %d, %d]\n",
                sensor[0], sensor[1], sensor[2],
                sensor[3], sensor[4], sensor[5]);

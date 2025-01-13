@@ -29,8 +29,6 @@ void ICM::begin(SPICreate *targetSPI, int cs, uint32_t freq)
     spi_device_interface_config_t if_cfg = {};
 
     // if_cfg.spics_io_num = cs;
-    if_cfg.pre_cb = NULL;
-    if_cfg.post_cb = NULL;
     if_cfg.cs_ena_pretrans = 0;
     if_cfg.cs_ena_posttrans = 0;
 
@@ -38,10 +36,7 @@ void ICM::begin(SPICreate *targetSPI, int cs, uint32_t freq)
 
     if_cfg.mode = 3; // 0 or 3
     if_cfg.queue_size = 1;
-
-    if_cfg.pre_cb = csReset;
-    if_cfg.post_cb = csSet;
-
+    
     deviceHandle = ICMSPI->addDevice(&if_cfg, cs);
 
     ICMSPI->setReg(POWER_MANAGEMENT, 0x0F, deviceHandle);

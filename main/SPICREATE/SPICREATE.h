@@ -12,7 +12,6 @@ class SPICreate
 {
     spi_bus_config_t bus_cfg = {};
     spi_device_handle_t handle[3];
-    int CSs[3];
     int deviceNum{0};
     spi_host_device_t host = SPI2_HOST;
     uint8_t mode = 3; // must be 1 or 3

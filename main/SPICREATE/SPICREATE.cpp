@@ -44,8 +44,6 @@ int SPICreate::addDevice(spi_device_interface_config_t *if_cfg, int cs)
     deviceNum++;
 
     if_cfg->spics_io_num = cs;
-    
-    CSs[deviceNum] = cs;
 
     if (deviceNum > 2) {
         ESP_LOGE("SPICreate", "Device number over");
@@ -77,7 +75,6 @@ void SPICreate::sendCmd(uint8_t cmd, int deviceHandle)
     comm.flags = SPI_TRANS_USE_TXDATA;
     comm.length = 8;
     comm.tx_data[0] = cmd;
-    comm.user = (void *)CSs[deviceHandle];
     pollTransmit(&comm, deviceHandle);
 }
 uint8_t SPICreate::readByte(uint8_t addr, int deviceHandle)
@@ -86,7 +83,6 @@ uint8_t SPICreate::readByte(uint8_t addr, int deviceHandle)
     comm.flags = SPI_TRANS_USE_RXDATA | SPI_TRANS_USE_TXDATA;
     comm.tx_data[0] = addr;
     comm.length = 16;
-    comm.user = (void *)CSs[deviceHandle];
     pollTransmit(&comm, deviceHandle);
     return comm.rx_data[1];
 }
