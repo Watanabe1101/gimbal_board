@@ -1,98 +1,131 @@
-/*
- Author : Yuta Takayasu
- Date : 2022/8/5
-
-    Q library.
-    
-*/
-
+#pragma once
 
 #pragma once
 
-class Q
+#include <stdint.h>
+#include <math.h>
+
+/**
+ * @brief クォータニオン姿勢推定クラス
+ * 
+ * - 内部は float で計算
+ * - ICM42688などの生データ (int16_t) を直接受け取り、内部でスケーリングして rad/s に変換
+ * - 1ms周期(例) など固定のサンプリング周期を前提とし、ジャイロのみでクォータニオンを更新
+ */
+class SimpleQuat
 {
-    private:
-        double dt;
-    
-    public:
-        double v[4];
-        double dpsi;
-        void init();
-        void update(double *acc,int real_dt);
-        void norm();
-        void calc_Euler(double *euler);
-        void vecRotate(double *vec, double *result);
-
-    Q(){
-        v[0] = 1.0;v[1] = 0;v[2] = 0;v[3] = 0;
+public:
+    /**
+     * @brief コンストラクタ
+     * 
+     * @param gyro_scale_factor  生データ(int16_t) -> [rad/s] へ変換する際のスケーリング係数
+     * @param dt_sec             サンプリング周期 [s] (例: 0.001f で 1ms)
+     */
+    SimpleQuat(float gyro_scale_factor, float dt_sec)
+        : gyro_scale_factor_(gyro_scale_factor)
+        , dt_sec_(dt_sec)
+    {
+        reset();
     }
-};
 
-void IRAM_ATTR Q::init(){
-    dt = 0.001;
-    v[0] = 1.0;v[1] = 0;v[2] = 0;v[3] = 0;
-}
+    /**
+     * @brief クォータニオンを初期化(単位元にリセット)する
+     */
+    void reset()
+    {
+        // w=1, x=y=z=0
+        q_[0] = 1.0f;
+        q_[1] = 0.0f;
+        q_[2] = 0.0f;
+        q_[3] = 0.0f;
+    }
 
-void IRAM_ATTR Q::update(double *acc,int real_dt){
-    double dt = (double)real_dt / 1000000.0;
+    /**
+     * @brief ジャイロの生データ (int16_t) を受け取り、内部で[rad/s]に換算 → クォータニオンを更新
+     * 
+     * @param raw_gyro  int16_t型の配列 [3] (X, Y, Z) の順でジャイロ生データを想定
+     */
+    void updateFromRawGyro(const int16_t raw_gyro[3])
+    {
+        // 1. 生データ -> [rad/s] へスケーリング
+        float gx = raw_gyro[0] * gyro_scale_factor_; // [rad/s]
+        float gy = raw_gyro[1] * gyro_scale_factor_;
+        float gz = raw_gyro[2] * gyro_scale_factor_;
 
+        // 2. クォータニオン更新
+        //    dq/dt = 0.5 * Omega(gyro) * q
+        //    離散化: q_new = q_old + 0.5 * dt * Omega(gyro)*q_old
+        float dt = dt_sec_;
+        float rotate[4][4] = {
+            { 0.0f, -gx,   -gy,   -gz   },
+            { gx,   0.0f,  gz,    -gy   },
+            { gy,   -gz,   0.0f,  gx    },
+            { gz,   gy,    -gx,   0.0f  }
+        };
 
-    double rotateArray[4][4] = { {0,        -acc[0],    -acc[1],    -acc[2] },
-                                {acc[0],   0,          acc[2],     -acc[1] },
-                                {acc[1],   -acc[2],    0,          acc[0]  },
-                                {acc[2],   acc[1],     -acc[0],    0       }};
+        float qnew[4] = {0,0,0,0};
+        for(int i = 0; i < 4; i++){
+            // 元のq_をベースに更新
+            qnew[i] = q_[i];
+            for(int k = 0; k < 4; k++){
+                qnew[i] += 0.5f * dt * rotate[i][k] * q_[k];
+            }
+        }
 
-
-    double qnew[4];
-    for(int i=0;i < 4;i++)qnew[i] = 0;
-
-    for(int i = 0;i < 4;i++){
-        qnew[i] = v[i];
-        for(int k = 0;k < 4;k++){
-            qnew[i] += (v[k]*rotateArray[i][k])/2.0f*dt;
+        // 3. 正規化
+        float mag = 0.0f;
+        for(int i = 0; i < 4; i++){
+            mag += qnew[i] * qnew[i];
+        }
+        mag = sqrtf(mag);
+        if(mag > 1e-8f){
+            for(int i = 0; i < 4; i++){
+                q_[i] = qnew[i] / mag;
+            }
         }
     }
 
-    for(int i=0;i < 4;i++)v[i] = qnew[i];
+    /**
+     * @brief 現在のクォータニオンからオイラー角 [roll, pitch, yaw] を取得 (単位=ラジアン)
+     * 
+     * @param euler_rad [out] float配列[3] へ (roll, pitch, yaw) [rad] を格納
+     * 
+     *  - roll = x軸周り回転
+     *  - pitch= y軸周り回転
+     *  - yaw  = z軸周り回転
+     * 
+     */
+    void getEulerRad(float euler_rad[3]) const
+    {
+        // ここではZ-Y-X系(= yaw-pitch-roll)の一例
+        // ただし実装や用途によって変化あり
 
-    norm();
+        const float w = q_[0];
+        const float x = q_[1];
+        const float y = q_[2];
+        const float z = q_[3];
 
-    return;
-}
+        // pitch = asin(2*(w*x - y*z))
+        float sinp = 2.0f * (w*x - y*z);
+        if(sinp >  1.0f) sinp =  1.0f;
+        if(sinp < -1.0f) sinp = -1.0f;
+        float pitch = asinf(sinp);
 
-void IRAM_ATTR Q::norm(){
-    double sca = v[0]*v[0] + v[1]*v[1] + v[2]*v[2] + v[3]*v[3];
-    sca = sqrt(sca);
-    v[0] /= sca; v[1] /= sca; v[2] /= sca; v[3] /= sca;
-    return;
-}
+        // roll = atan2(2(w*y + x*z), w^2 + z^2 - x^2 - y^2)
+        float roll  = atan2f( 2.0f*(w*y + x*z),
+                              w*w + z*z - x*x - y*y );
 
-void IRAM_ATTR Q::calc_Euler(double *euler){
-	euler[0] = asin(2*(v[0]*v[1]-v[2]*v[3]));
-	euler[1] = atan2(2*(v[1]*v[3]+v[0]*v[2]),v[0]*v[0]-v[1]*v[1]-v[2]*v[2]+v[3]*v[3]);
-	euler[2] = atan2(2*(v[1]*v[2]+v[0]*v[3]),v[0]*v[0]-v[1]*v[1]+v[2]*v[2]-v[3]*v[3]);
-}
+        // yaw = atan2(2(w*z + x*y), w^2 + x^2 - y^2 - z^2)
+        float yaw   = atan2f( 2.0f*(w*z + x*y),
+                              w*w + x*x - y*y - z*z );
 
-void IRAM_ATTR Q::vecRotate(double *vec, double *result){
-    double veq[4];
-    double tmp[4];
-    double inv[4];
-    double req[4];
+        euler_rad[0] = roll;
+        euler_rad[1] = pitch;
+        euler_rad[2] = yaw;
+    }
 
-    inv[0] = v[0]; inv[1] = -v[1]; inv[2] = -v[2]; inv[3] = -v[3];
-    veq[0] = 0; veq[1] = vec[0]; veq[2] = vec[1]; veq[3] = vec[2];
-    
-    tmp[0] = v[0] * veq[0] - v[1] * veq[1] - v[2] * veq[2] - v[3] * veq[3];
-    tmp[1] = v[1] * veq[0] + v[0] * veq[1] - v[3] * veq[2] + v[2] * veq[3];
-    tmp[2] = v[2] * veq[0] + v[3] * veq[1] + v[0] * veq[2] - v[1] * veq[3];
-    tmp[3] = v[3] * veq[0] - v[2] * veq[1] + v[1] * veq[2] + v[0] * veq[3];
-
-    req[0] = tmp[0] * inv[0] - tmp[1] * inv[1] - tmp[2] * inv[2] - tmp[3] * inv[3];
-    req[1] = tmp[1] * inv[0] + tmp[0] * inv[1] - tmp[3] * inv[2] + tmp[2] * inv[3];
-    req[2] = tmp[2] * inv[0] + tmp[3] * inv[1] + tmp[0] * inv[2] - tmp[1] * inv[3];
-    req[3] = tmp[3] * inv[0] - tmp[2] * inv[1] + tmp[1] * inv[2] + tmp[0] * inv[3];
-    
-    result[0] = req[1]; result[1] = req[2]; result[2] = req[3];
-
-    return;
-}
+private:
+    float q_[4];            ///< クォータニオン (w, x, y, z)
+    float gyro_scale_factor_; ///< 生データ(int16)→[rad/s]変換係数
+    float dt_sec_;          ///< サンプリング周期 [s]
+};
