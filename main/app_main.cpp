@@ -13,6 +13,7 @@
 #include "SPICREATE.h"
 #include "ICM42688.h"
 #include "gptimer.h"
+#include "SimpleQuat.h"
 
 //1Mhz分解能 -> alarm_count == 1000
 #define TIMER_RESOLUTION_HZ (1000*1000) //1Mhz
@@ -43,6 +44,10 @@ static bool IRAM_ATTR sensorTimerCallback(gptimer_handle_t timer,
 
     return (xHigherPriorityTaskWoken == pdTRUE);
 }
+
+//スケーリング係数
+static constexpr float GYRO_SCALE_2000DPS =
+    (1.0f / 16.4f) * (3.1415926535f / 180.0f);
 
 extern "C" void app_main(void)
 {
@@ -90,15 +95,26 @@ extern "C" void app_main(void)
         return;
     }
 
+    static SimpleQuat quat(GYRO_SCALE_2000DPS, 0.001f);
+
     // 7. メインループ: 1kHzでISRから送られるセンサデータを表示
     while (true) {
         sensor_data_t recvData;
-        // キューにデータが届くのを待つ (最大待ち時間はportMAX_DELAY)
-        if (xQueueReceive(g_sensorQueue, &recvData, portMAX_DELAY) == pdTRUE) {
-            // 受け取ったデータを表示 (ここは通常のタスクコンテキストなのでprintf可能)
-            printf("Accel: [%d, %d, %d], Gyro: [%d, %d, %d]\n",
-                   recvData.sensor[0], recvData.sensor[1], recvData.sensor[2],
-                   recvData.sensor[3], recvData.sensor[4], recvData.sensor[5]);
+        if(xQueueReceive(g_sensorQueue, &recvData, portMAX_DELAY) == pdTRUE){
+            // 角速度は recvData.sensor[3..5] と仮定
+            quat.updateFromRawGyro(&recvData.sensor[3]);
+
+            // オイラー角(RAD)を取得
+            float euler[3];
+            quat.getEulerRad(euler);
+
+            // 必要に応じて deg に変換して表示
+            float roll_deg  = euler[0] * (180.0f/M_PI);
+            float pitch_deg = euler[1] * (180.0f/M_PI);
+            float yaw_deg   = euler[2] * (180.0f/M_PI);
+
+            printf("Roll=%.4f deg, Pitch=%.4f deg, Yaw=%.4f deg\n",
+                   roll_deg, pitch_deg, yaw_deg);
         }
     }
 }
