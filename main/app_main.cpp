@@ -8,160 +8,102 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "freertos/queue.h"
 #include "driver/gpio.h"
 #include "foc/esp_foc.h"
 #include "svpwm/esp_svpwm.h"
 #include "esp_timer.h"
 #include "esp_system.h"
+
 #include "SPICREATE.h"
 #include "ICM42688.h"
+#include "gptimer.h"
 
-static const char *TAG = "example_foc";
-static const char *TAG_IMU = "IMU";
+//1Mhz分解能 -> alarm_count == 1000
+#define TIMER_RESOLUTION_HZ (1000*1000) //1Mhz
+#define TIMER_ALARM_COUNT (1000) //1000ticks = 1ms
 
-//////////////////////////////////////////////////////////////////////////////////////////////////////////
-////////////// Please update the following configuration according to your HardWare spec /////////////////
-//////////////////////////////////////////////////////////////////////////////////////////////////////////
-#define EXAMPLE_FOC_DRV_EN_GPIO          46
-#define EXAMPLE_FOC_DRV_FAULT_GPIO       9
-#define EXAMPLE_FOC_PWM_UH_GPIO          10
-#define EXAMPLE_FOC_PWM_UL_GPIO          21
-#define EXAMPLE_FOC_PWM_VH_GPIO          11
-#define EXAMPLE_FOC_PWM_VL_GPIO          13
-#define EXAMPLE_FOC_PWM_WH_GPIO          12
-#define EXAMPLE_FOC_PWM_WL_GPIO          14
+typedef struct {
+    int16_t sensor[6];
+} sensor_data_t;
 
-#define EXAMPLE_FOC_MCPWM_TIMER_RESOLUTION_HZ 10000000 // 10MHz, 1 tick = 0.1us
-#define EXAMPLE_FOC_MCPWM_PERIOD              400     // 1000 * 0.1us = 100us, 10KHz
+static QueueHandle_t g_sensorQueue = nullptr;
 
-#define EXAMPLE_FOC_WAVE_FREQ    1         // 50Hz 3 phase AC wave
-#define EXAMPLE_FOC_WAVE_AMPL    100        // Wave amplitude, Use up-down timer mode, max value should be (EXAMPLE_FOC_MCPWM_PERIOD/2)
+static ICM icm;
 
-void bsp_bridge_driver_init(void)
+static bool IRAM_ATTR sensorTimerCallback(gptimer_handle_t timer,
+                                          const gptimer_alarm_event_data_t *edata,
+                                          void *user_ctx)
 {
-    gpio_config_t drv_en_config = {
-        .mode = GPIO_MODE_OUTPUT,
-        .pin_bit_mask = 1ULL << EXAMPLE_FOC_DRV_EN_GPIO,
-    };
-    ESP_ERROR_CHECK(gpio_config(&drv_en_config));
-}
-
-void bsp_bridge_driver_enable(bool enable)
-{
-    ESP_LOGI(TAG, "%s MOSFET gate", enable ? "Enable" : "Disable");
-    gpio_set_level(EXAMPLE_FOC_DRV_EN_GPIO, enable);
-}
-
-bool IRAM_ATTR inverter_update_cb(mcpwm_timer_handle_t timer, const mcpwm_timer_event_data_t *edata, void *user_ctx)
-{
-    BaseType_t task_yield = pdFALSE;
-    xSemaphoreGiveFromISR(*((SemaphoreHandle_t *)user_ctx), &task_yield);
-    return task_yield;
-}
-
-void app_main(void)
-{
-    esp_log_level_set("*", ESP_LOG_INFO);
-    ESP_LOGI(TAG, "Hello FOC");
-    // counting semaphore used to sync update foc calculation when mcpwm timer updated
-    SemaphoreHandle_t update_semaphore = xSemaphoreCreateCounting(1, 0);
-
-    foc_dq_coord_t dq_out = {_IQ(0), _IQ(0)};
-    foc_ab_coord_t ab_out;
-    foc_uvw_coord_t uvw_out;
-    int uvw_duty[3];
-    float elec_theta_deg = 0;
-    _iq elec_theta_rad;
-
-    inverter_config_t cfg = {
-        .timer_config = {
-            .group_id = 0,
-            .clk_src = MCPWM_TIMER_CLK_SRC_DEFAULT,
-            .resolution_hz = EXAMPLE_FOC_MCPWM_TIMER_RESOLUTION_HZ,
-            .count_mode = MCPWM_TIMER_COUNT_MODE_UP_DOWN,   //UP_DOWN mode will generate center align pwm wave, which can reduce MOSFET switch times on same effect, extend life
-            .period_ticks = EXAMPLE_FOC_MCPWM_PERIOD,
-        },
-        .operator_config = {
-            .group_id = 0,
-        },
-        .compare_config = {
-            .flags.update_cmp_on_tez = true,
-        },
-        .gen_gpios = {
-            {EXAMPLE_FOC_PWM_UH_GPIO, EXAMPLE_FOC_PWM_UL_GPIO},
-            {EXAMPLE_FOC_PWM_VH_GPIO, EXAMPLE_FOC_PWM_VL_GPIO},
-            {EXAMPLE_FOC_PWM_WH_GPIO, EXAMPLE_FOC_PWM_WL_GPIO},
-        },
-        .dt_config = {
-            .posedge_delay_ticks = 5,
-        },
-        .inv_dt_config = {
-            .negedge_delay_ticks = 5,
-            .flags.invert_output = true,
-        },
-    };
-    inverter_handle_t inverter1;
-    ESP_ERROR_CHECK(svpwm_new_inverter(&cfg, &inverter1));
-    ESP_LOGI(TAG, "Inverter init OK");
-
-    mcpwm_timer_event_callbacks_t cbs = {
-        .on_full = inverter_update_cb,
-    };
-    ESP_ERROR_CHECK(svpwm_inverter_register_cbs(inverter1, &cbs, &update_semaphore));
-    ESP_ERROR_CHECK(svpwm_inverter_start(inverter1, MCPWM_TIMER_START_NO_STOP));
-    ESP_LOGI(TAG, "Inverter start OK");
-
-    // Enable gate driver chip
-    bsp_bridge_driver_init();
-    bsp_bridge_driver_enable(true);
-
-    ESP_LOGI(TAG, "Start FOC");
-
-    int foc_iteration_count = 0; // カウンタ初期化
-
-    while (true) {
-        xSemaphoreTake(update_semaphore, portMAX_DELAY);
-
-        // 処理時間計測の開始
-        int64_t start_time = esp_timer_get_time();
-
-        // Calculate elec_theta_deg increase step of 50Hz output on 10000Hz call
-        elec_theta_deg += (EXAMPLE_FOC_WAVE_AMPL * 360.f) / (EXAMPLE_FOC_MCPWM_TIMER_RESOLUTION_HZ / EXAMPLE_FOC_WAVE_FREQ);
-        if (elec_theta_deg > 360) {
-            elec_theta_deg -= 360;
-        }
-        elec_theta_rad = _IQmpy(_IQ(elec_theta_deg), _IQ(M_PI / 180.f));
-
-        // In FOC motor control, we usually set Vd for alignment or weak-meg control, and set Vq for torque control.
-        // As here is open loop output, use Vd is enough, and coord aligned
-        dq_out.d = _IQ(EXAMPLE_FOC_WAVE_AMPL);
-        foc_inverse_park_transform(elec_theta_rad, &dq_out, &ab_out);
-
-    #if CONFIG_ESP_FOC_USE_SVPWM
-        foc_svpwm_duty_calculate(&ab_out, &uvw_out);
-    #else   // Use spwm (sin pwm) instead. (see menuconfig help to know difference between SVPWM and SPWM)
-        foc_inverse_clarke_transform(&ab_out, &uvw_out);
-    #endif
-        // Regular uvw data to (0 ~ (EXAMPLE_FOC_MCPWM_PERIOD/2))
-        uvw_duty[0] = _IQtoF(_IQdiv2(uvw_out.u)) + (EXAMPLE_FOC_MCPWM_PERIOD / 4);
-        uvw_duty[1] = _IQtoF(_IQdiv2(uvw_out.v)) + (EXAMPLE_FOC_MCPWM_PERIOD / 4);
-        uvw_duty[2] = _IQtoF(_IQdiv2(uvw_out.w)) + (EXAMPLE_FOC_MCPWM_PERIOD / 4);
-
-        // output pwm duty
-        ESP_ERROR_CHECK(svpwm_inverter_set_duty(inverter1, uvw_duty[0], uvw_duty[1], uvw_duty[2]));
-
-        // 処理時間計測の終了
-        int64_t end_time = esp_timer_get_time();
-        foc_iteration_count++;
-
-        // 100回に1回処理時間を出力
-        if (foc_iteration_count % 100 == 0) {
-            ESP_LOGI(TAG, "FOC iteration %d: Processing time = %lld us", foc_iteration_count, end_time - start_time);
-        }
+    sensor_data_t sdata;
+    
+    int16_t sensor[6] = {0};
+    icm.Get(sensor);
+    for(int i=0; i<6; i++){
+        sdata.sensor[i] = sensor[i];
     }
 
-    bsp_bridge_driver_enable(false);
-    ESP_ERROR_CHECK(svpwm_inverter_start(inverter1, MCPWM_TIMER_STOP_EMPTY));
-    ESP_ERROR_CHECK(svpwm_del_inverter(inverter1));
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    xQueueSendFromISR(g_sensorQueue, &sdata, &xHigherPriorityTaskWoken);
+
+    return (xHigherPriorityTaskWoken == pdTRUE);
 }
 
+extern "C" void app_main(void)
+{
+    // 1. SPIバス初期化
+    static SPICreate spi;
+    bool ret = spi.begin(
+        SPI2_HOST,
+        (gpio_num_t)6,   // SCLK
+        (gpio_num_t)4,   // MISO
+        (gpio_num_t)5,   // MOSI
+        8 * 1000 * 1000  // 8MHz
+    );
+    if (!ret) {
+        printf("SPI begin failed\n");
+        return;
+    }
+
+    // 2. ICM42688初期化
+    //    CS=GPIO_NUM_40 (例)、周波数=8MHz
+    icm.begin(&spi, (gpio_num_t)40, 8 * 1000 * 1000);
+
+    // 3. センサデータを受け取るキューを作成
+    g_sensorQueue = xQueueCreate(10, sizeof(sensor_data_t));
+    if (!g_sensorQueue) {
+        printf("Failed to create sensor queue\n");
+        return;
+    }
+
+    // 4. GPTimerインスタンスを生成＆初期化 (1MHz, alarm=1000)
+    static GPTimer gpt;
+    if (!gpt.init(TIMER_RESOLUTION_HZ, TIMER_ALARM_COUNT)) {
+        printf("Failed to init GPTimer\n");
+        return;
+    }
+
+    // 5. コールバック登録
+    if (!gpt.registerCallback(sensorTimerCallback)) {
+        printf("Failed to register GPTimer callback\n");
+        return;
+    }
+
+    // 6. タイマー開始
+    if (!gpt.start()) {
+        printf("Failed to start GPTimer\n");
+        return;
+    }
+
+    // 7. メインループ: 1kHzでISRから送られるセンサデータを表示
+    while (true) {
+        sensor_data_t recvData;
+        // キューにデータが届くのを待つ (最大待ち時間はportMAX_DELAY)
+        if (xQueueReceive(g_sensorQueue, &recvData, portMAX_DELAY) == pdTRUE) {
+            // 受け取ったデータを表示 (ここは通常のタスクコンテキストなのでprintf可能)
+            printf("Accel: [%d, %d, %d], Gyro: [%d, %d, %d]\n",
+                   recvData.sensor[0], recvData.sensor[1], recvData.sensor[2],
+                   recvData.sensor[3], recvData.sensor[4], recvData.sensor[5]);
+        }
+    }
+}
