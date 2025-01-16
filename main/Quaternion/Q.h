@@ -9,10 +9,6 @@
 
 #pragma once
 
-#ifndef Q_H
-#define Q_H
-#include <Arduino.h>
-
 class Q
 {
     private:
@@ -100,5 +96,3 @@ void IRAM_ATTR Q::vecRotate(double *vec, double *result){
 
     return;
 }
-
-#endif
