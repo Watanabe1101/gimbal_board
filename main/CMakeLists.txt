@@ -8,5 +8,6 @@ idf_component_register(
                  "SPICREATE"
                  "icm42688"
                  "gptimer"
+                 "Quaternion"
     REQUIRES driver esp_timer log
 )
