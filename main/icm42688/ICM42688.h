@@ -36,7 +36,7 @@ void ICM::begin(SPICreate *targetSPI, int cs, uint32_t freq)
 
     if_cfg.mode = 3; // 0 or 3
     if_cfg.queue_size = 1;
-    
+
     deviceHandle = ICMSPI->addDevice(&if_cfg, cs);
 
     ICMSPI->setReg(POWER_MANAGEMENT, 0x0F, deviceHandle);
