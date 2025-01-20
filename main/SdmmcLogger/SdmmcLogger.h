@@ -126,7 +126,7 @@ public:
         }
         if (mounted)
         {
-            esp_vfs_fat_sdmmc_unmount();
+            esp_vfs_fat_sdcard_unmount(mount_point.c_str(), card);
             mounted = false;
         }
         // 確保したバッファを解放
