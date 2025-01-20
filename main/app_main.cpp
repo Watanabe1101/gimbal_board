@@ -5,59 +5,69 @@
 #include "freertos/semphr.h"
 #include "freertos/queue.h"
 #include "driver/gpio.h"
-#include "foc/esp_foc.h"
-#include "svpwm/esp_svpwm.h"
 #include "esp_timer.h"
 #include "esp_system.h"
 
+// SPI & IMU
 #include "SPICREATE.h"
-#include "ICM42688.h"
+#include "ICM42688.h" // ユーザ定義IMUライブラリ
 #include "gptimer.h"
 #include "SimpleQuat.h"
 
-// 1Mhz分解能 -> alarm_count == 1000
-#define TIMER_RESOLUTION_HZ (1000 * 1000) // 1Mhz
-#define TIMER_ALARM_COUNT (1000)          // 1000ticks = 1ms
+// SDMMC Logger (バッファリング対応版を使用してください)
+#include "SdmmcLogger.h"
 
+#define TIMER_RESOLUTION_HZ (1000 * 1000) // 1MHz
+#define TIMER_ALARM_COUNT (1000)          // 1000ticks = 1ms(=1kHz)
+
+// センサデータをキューでやりとりするための構造体
 typedef struct
 {
     int16_t sensor[6];
+    uint64_t timestamp_us;
 } sensor_data_t;
 
-static QueueHandle_t g_sensorQueue = nullptr;
+// グローバル変数
+static QueueHandle_t g_sensorQueue = nullptr; // センサー生データ用キュー
+static SPICreate g_spi;                       // SPIクラス
+static ICM g_icm;                             // IMU
+static SdmmcLogger g_sdCard;                  // SDカードロガー
+static GPTimer g_gpt;                         // GPTimer
 
-static ICM icm;
+// 角速度スケーリング係数 (ICM42688 ±2000dps相当)
+static constexpr float GYRO_SCALE_2000DPS = (1.0f / 16.4f) * (3.1415926535f / 180.0f);
 
+// 割り込みコールバック(1kHz)
 static bool IRAM_ATTR sensorTimerCallback(gptimer_handle_t timer,
                                           const gptimer_alarm_event_data_t *edata,
                                           void *user_ctx)
 {
+    // IMUからセンサ値を取得
     sensor_data_t sdata;
-
     int16_t sensor[6] = {0};
-    icm.Get(sensor);
+    g_icm.Get(sensor);
+
     for (int i = 0; i < 6; i++)
     {
         sdata.sensor[i] = sensor[i];
     }
+    // タイムスタンプ(μs)
+    sdata.timestamp_us = (uint64_t)esp_timer_get_time();
 
+    // キューへ送る
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
     xQueueSendFromISR(g_sensorQueue, &sdata, &xHigherPriorityTaskWoken);
 
     return (xHigherPriorityTaskWoken == pdTRUE);
 }
 
-// スケーリング係数
-static constexpr float GYRO_SCALE_2000DPS =
-    (1.0f / 16.4f) * (3.1415926535f / 180.0f);
-
-// プリント頻度
-static uint32_t printcount = 0;
-extern "C" void app_main(void)
+// -----------------------------
+// センサー側タスク
+// -----------------------------
+static void sensorTask(void *args)
 {
-    // 1. SPIバス初期化
-    static SPICreate spi;
-    bool ret = spi.begin(
+    // 1. SPI初期化
+    bool ret = g_spi.begin(
         SPI2_HOST,
         (gpio_num_t)6,  // SCLK
         (gpio_num_t)4,  // MISO
@@ -66,102 +76,170 @@ extern "C" void app_main(void)
     );
     if (!ret)
     {
-        printf("SPI begin failed\n");
+        ESP_LOGE("sensorTask", "SPI begin failed");
+        vTaskDelete(NULL);
         return;
     }
 
     // 2. ICM42688初期化
-    //    CS=GPIO_NUM_40 (例)、周波数=8MHz
-    icm.begin(&spi, (gpio_num_t)40, 8 * 1000 * 1000);
+    g_icm.begin(&g_spi, (gpio_num_t)40, 8 * 1000 * 1000);
 
-    // 3. センサデータを受け取るキューを作成
-    g_sensorQueue = xQueueCreate(10, sizeof(sensor_data_t));
+    // 3. キューを作成 (深さは必要に応じて調整)
+    g_sensorQueue = xQueueCreate(512, sizeof(sensor_data_t));
     if (!g_sensorQueue)
     {
-        printf("Failed to create sensor queue\n");
+        ESP_LOGE("sensorTask", "Failed to create sensor queue");
+        vTaskDelete(NULL);
         return;
     }
 
-    // 4. GPTimerインスタンスを生成＆初期化 (1MHz, alarm=1000)
-    static GPTimer gpt;
-    if (!gpt.init(TIMER_RESOLUTION_HZ, TIMER_ALARM_COUNT))
+    // 4. GPTimer初期化 (1MHz, アラーム=1000 → 1kHz)
+    if (!g_gpt.init(TIMER_RESOLUTION_HZ, TIMER_ALARM_COUNT))
     {
-        printf("Failed to init GPTimer\n");
+        ESP_LOGE("sensorTask", "Failed to init GPTimer");
+        vTaskDelete(NULL);
         return;
     }
-
-    // 5. コールバック登録
-    if (!gpt.registerCallback(sensorTimerCallback))
+    // コールバック登録 (ISRでセンサー読み込み & キュー送信)
+    if (!g_gpt.registerCallback(sensorTimerCallback))
     {
-        printf("Failed to register GPTimer callback\n");
+        ESP_LOGE("sensorTask", "Failed to register GPTimer callback");
+        vTaskDelete(NULL);
         return;
     }
 
-    // 6. タイマー開始
-    if (!gpt.start())
+    // 5. タイマー開始
+    if (!g_gpt.start())
     {
-        printf("Failed to start GPTimer\n");
+        ESP_LOGE("sensorTask", "Failed to start GPTimer");
+        vTaskDelete(NULL);
         return;
     }
 
-    static SimpleQuat quat(GYRO_SCALE_2000DPS, 0.001f);
+    ESP_LOGI("sensorTask", "Sensor reading started (1kHz by GPTimer)");
 
-    printf("Start gyro bias calibration for 60sec...\n");
-    const int sample_count = 1000 * 60; // 1kHz × 60秒 = 60000サンプル
+    // 割り込みが動いている間、ここでは特にすることがない
+    // 必要に応じて他の処理を入れてもよい
+    while (true)
+    {
+        // 1秒に1回程度ログを出すなど
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        ESP_LOGD("sensorTask", "Sensor task alive...");
+    }
+
+    vTaskDelete(NULL);
+}
+
+// -----------------------------
+// ロギングタスク
+// -----------------------------
+static void loggingTask(void *args)
+{
+    // 1. SDカード初期化 (バッファリング対応)
+    //    例: HighSpeed = false, mountPoint="/sdcard", logFile="/sdcard/gyro_log.csv"
+    bool useHighSpeed = false;
+    if (!g_sdCard.begin(useHighSpeed, "/sdcard", "/sdcard/gyro_log.csv"))
+    {
+        ESP_LOGE("loggingTask", "Failed to mount or open log file.");
+        vTaskDelete(NULL);
+        return;
+    }
+    ESP_LOGI("loggingTask", "SD card initialized");
+
+    // 2. クォータニオン演算用インスタンス (サンプリング周期=1kHz → 0.001f)
+    SimpleQuat quat(GYRO_SCALE_2000DPS, 0.001f);
+
+    // -----------------------------
+    // 2-1. キャリブレーション
+    // -----------------------------
+    ESP_LOGI("loggingTask", "Start gyro bias calibration for 60sec...");
+    const int sample_count = 1000 * 60; // 60秒
     float sumX = 0.0f, sumY = 0.0f, sumZ = 0.0f;
-    int count = 0;
+    int countSample = 0;
 
-    // 60秒間、センサ値を受信して累積
     for (int i = 0; i < sample_count; i++)
     {
         sensor_data_t data;
-        // ISRが送信してくるキューをブロック付きで待ち受ける
+        // キューからデータを取り出す (60秒間は連続で待つ)
         if (xQueueReceive(g_sensorQueue, &data, portMAX_DELAY) == pdTRUE)
         {
-            // 角速度は data.sensor[3..5]
             sumX += data.sensor[3];
             sumY += data.sensor[4];
             sumZ += data.sensor[5];
-            count++;
+            countSample++;
         }
-        // WDTを回避したい場合は、例えばここで多少のyieldやdelayを挟む
-        // vTaskDelay(1) とすると1msスリープし、1分より長くなってしまうがWDTは回避しやすくなる
-        // vTaskDelay(0) は単にtaskYIELD()相当で、他タスクに切り替わる余地を与える
-        // ここでは割愛
     }
 
-    // 平均をバイアスとして設定 (生データ値)
-    float offsetX = (count > 0) ? (sumX / count) : 0.0f;
-    float offsetY = (count > 0) ? (sumY / count) : 0.0f;
-    float offsetZ = (count > 0) ? (sumZ / count) : 0.0f;
+    float offsetX = (countSample > 0) ? (sumX / countSample) : 0.0f;
+    float offsetY = (countSample > 0) ? (sumY / countSample) : 0.0f;
+    float offsetZ = (countSample > 0) ? (sumZ / countSample) : 0.0f;
     quat.setGyroBias(offsetX, offsetY, offsetZ);
 
-    printf("Calibration done! Gyro bias = (%.2f, %.2f, %.2f)\n",
-           offsetX, offsetY, offsetZ);
+    ESP_LOGI("loggingTask", "Calibration done! Gyro bias = (%.2f, %.2f, %.2f)",
+             offsetX, offsetY, offsetZ);
 
-    // 7. メインループ: 1kHzでISRから送られるセンサデータを表示
+    // -----------------------------
+    // 2-2. 通常ロギング
+    // -----------------------------
+    uint32_t printcount = 0; // コンソール出力用カウンタ
     while (true)
     {
         sensor_data_t recvData;
+        // センサデータを待つ
         if (xQueueReceive(g_sensorQueue, &recvData, portMAX_DELAY) == pdTRUE)
         {
-            // 角速度は recvData.sensor[3..5] と仮定
+            // クォータニオン更新(角速度=recvData.sensor[3..5])
             quat.updateFromRawGyro(&recvData.sensor[3]);
 
-            // オイラー角(RAD)を取得
+            // オイラー角計算(ラジアン)
             float euler[3];
             quat.getEulerRad(euler);
 
-            // 必要に応じて deg に変換して表示
-            float roll_deg = euler[0] * (180.0f / M_PI);
-            float pitch_deg = euler[1] * (180.0f / M_PI);
-            float yaw_deg = euler[2] * (180.0f / M_PI);
-            if (printcount++ == 10)
+            // 度数法に変換
+            float roll_deg = euler[0] * (180.0f / 3.1415926535f);
+            float pitch_deg = euler[1] * (180.0f / 3.1415926535f);
+            float yaw_deg = euler[2] * (180.0f / 3.1415926535f);
+
+            // ログファイルへ書き込み
+            g_sdCard.writeLog(
+                recvData.timestamp_us,
+                recvData.sensor[3],
+                recvData.sensor[4],
+                recvData.sensor[5],
+                roll_deg, pitch_deg, yaw_deg);
+
+            // 100回に1回コンソールへ
+            if (printcount++ == 100)
             {
-                printf("Roll=%.4f deg, Pitch=%.4f deg, Yaw=%.4f deg\n",
-                       roll_deg, pitch_deg, yaw_deg);
+                g_sdCard.flush();
+                ESP_LOGI("loggingTask", "[%.2f ms] GYRO=(%d,%d,%d), EULER=(%.2f, %.2f, %.2f)",
+                         recvData.timestamp_us / 1000.0,
+                         recvData.sensor[3], recvData.sensor[4], recvData.sensor[5],
+                         roll_deg, pitch_deg, yaw_deg);
                 printcount = 0;
             }
         }
+    }
+
+    // (実際にタスクが終了する場合はファイルをクローズ)
+    // g_sdCard.end();
+    vTaskDelete(NULL);
+}
+
+// -----------------------------
+// メイン (タスク生成)
+// -----------------------------
+extern "C" void app_main(void)
+{
+    // センサータスク作成
+    xTaskCreatePinnedToCore(sensorTask, "sensorTask", 4096, NULL, 5, NULL, 1);
+    // ロギングタスク作成
+    xTaskCreatePinnedToCore(loggingTask, "loggingTask", 4096, NULL, 5, NULL, 1);
+
+    // メインタスクは何もしない場合
+    // (不要なら vTaskDelete(NULL) で自滅しても可)
+    while (1)
+    {
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
