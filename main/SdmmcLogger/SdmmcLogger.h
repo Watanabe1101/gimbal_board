@@ -2,6 +2,7 @@
 #ifndef SDMMC_LOGGER_H
 #define SDMMC_LOGGER_H
 
+#include <unistd.h> // ★追加: fsync用
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -153,9 +154,17 @@ public:
     // fflush()のラッパ (必要に応じて呼び出し)
     void flush()
     {
-        if (fp)
+        if (!fp)
+            return;
+
+        // ★ 1) fflushでライブラリバッファをクリア
+        fflush(fp);
+
+        // ★ 2) fsyncでOSレベルのキャッシュを物理メディアへ書き込み
+        int fd = fileno(fp); // ファイルディスクリプタ取得
+        if (fd >= 0)
         {
-            fflush(fp);
+            fsync(fd);
         }
     }
 };
