@@ -9,68 +9,62 @@
 #include "driver/sdmmc_host.h"
 #include "esp_vfs_fat.h"
 #include "sdmmc_cmd.h"
+#include "esp_heap_caps.h"
 
-/**
- * @class SdmmcLogger
- * SDMMCを使ったロギング用クラス
- */
 class SdmmcLogger
 {
 private:
-    sdmmc_card_t *card = nullptr;             // SDカード情報
-    FILE *fp = nullptr;                       // ログファイルのFILEポインタ
-    bool mounted = false;                     // マウント済みかどうか
-    bool highSpeed = false;                   // ハイスピードモードかどうか
-    std::string mount_point = "/sdcard";      // マウント先パス
-    std::string log_path = "/sdcard/log.csv"; // ログファイルパス
-
-    // 現在の設定周波数(kHz)
-    // デフォルトは 20MHz (SDMMC_FREQ_DEFAULT = 20000)
+    sdmmc_card_t *card = nullptr;
+    FILE *fp = nullptr;
+    bool mounted = false;
+    bool highSpeed = false;
+    std::string mount_point = "/sdcard";
+    std::string log_path = "/sdcard/log.csv";
     uint32_t freq_khz = SDMMC_FREQ_DEFAULT;
 
+    // ▼ DMA対応のバッファを確保して使う例
+    //   4KB程度(4096バイト)以上にすると書き込みの効率が上がる
+    //   MALLOC_CAP_DMA: DMA対応領域へ確保
+    static constexpr size_t LOG_BUFFER_SIZE = 4 * 1024;
+    char *dmaBuffer = nullptr;
+
 public:
-    /**
-     * @brief begin() - SDMMC初期化＆マウント
-     * @param useHighSpeed trueなら40MHzを使う(ハイスピードモード)
-     * @param mountPoint   マウント先のパス(例: "/sdcard")
-     * @param logFile      ログファイルのパス(例: "/sdcard/log.csv")
-     * @return true: 成功, false: 失敗
-     */
     bool begin(bool useHighSpeed = false,
                const char *mountPoint = "/sdcard",
-               const char *logFile = "/sdcard/log.csv")
+               const char *logFile = "/sdcard/log.csv",
+               // 追加: ピンをユーザーが指定したい場合
+               int gpio_clk = GPIO_NUM_43,
+               int gpio_cmd = GPIO_NUM_44,
+               int gpio_d0 = GPIO_NUM_2,
+               int gpio_d1 = GPIO_NUM_1,
+               int gpio_d2 = GPIO_NUM_41,
+               int gpio_d3 = GPIO_NUM_42)
     {
-        // 1) 既にマウント済みなら何もしない
         if (mounted)
         {
             ESP_LOGW("SDMMC", "Already mounted");
             return true;
         }
 
-        // 2) パラメータ設定
         mount_point = mountPoint;
         log_path = logFile;
         highSpeed = useHighSpeed;
         freq_khz = highSpeed ? SDMMC_FREQ_HIGHSPEED : SDMMC_FREQ_DEFAULT;
 
-        // 3) ホスト＆スロットの設定
         sdmmc_host_t host = SDMMC_HOST_DEFAULT();
-        host.max_freq_khz = freq_khz; // 20MHz or 40MHz
+        host.max_freq_khz = freq_khz;
 
         sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
-        // ピン割り当て
-        slot_config.clk = GPIO_NUM_43;
-        slot_config.cmd = GPIO_NUM_44;
-        slot_config.d0 = GPIO_NUM_2;
-        slot_config.d1 = GPIO_NUM_1;
-        slot_config.d2 = GPIO_NUM_41;
-        slot_config.d3 = GPIO_NUM_42;
-
-        slot_config.width = 4; // 4ビットバス
-        // 内部プルアップ有効 (外付け推奨)
+        // ▼ユーザーが指定したピンを設定
+        slot_config.clk = (gpio_num_t)gpio_clk;
+        slot_config.cmd = (gpio_num_t)gpio_cmd;
+        slot_config.d0 = (gpio_num_t)gpio_d0;
+        slot_config.d1 = (gpio_num_t)gpio_d1;
+        slot_config.d2 = (gpio_num_t)gpio_d2;
+        slot_config.d3 = (gpio_num_t)gpio_d3;
+        slot_config.width = 4;
         slot_config.flags = SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
 
-        // 4) マウント設定
         esp_vfs_fat_sdmmc_mount_config_t mount_config = {
             .format_if_mount_failed = false,
             .max_files = 5,
@@ -80,23 +74,21 @@ public:
         ESP_LOGI("SDMMC", "Mounting SD card at %s (freq=%.2f MHz)...",
                  mount_point.c_str(), freq_khz / 1000.0f);
 
-        // 5) マウント実行
-        esp_err_t ret = esp_vfs_fat_sdmmc_mount(mount_point.c_str(),
-                                                &host,
-                                                &slot_config,
-                                                &mount_config,
-                                                &card);
+        esp_err_t ret = esp_vfs_fat_sdmmc_mount(
+            mount_point.c_str(),
+            &host,
+            &slot_config,
+            &mount_config,
+            &card);
         if (ret != ESP_OK)
         {
             ESP_LOGE("SDMMC", "Mount failed (0x%x)", ret);
             return false;
         }
         mounted = true;
-
-        // カード情報表示
         sdmmc_card_print_info(stdout, card);
 
-        // 6) ログファイルを開く (w:上書き)
+        // ログファイルを開く
         fp = fopen(log_path.c_str(), "w");
         if (!fp)
         {
@@ -105,15 +97,25 @@ public:
         }
         ESP_LOGI("SDMMC", "Log file opened: %s", log_path.c_str());
 
-        // 7) ヘッダ行などを書いておきたい場合はここで
+        // ▼ DMA対応領域へ大きめのバッファを確保し、setvbuf() に設定
+        dmaBuffer = (char *)heap_caps_malloc(LOG_BUFFER_SIZE, MALLOC_CAP_DMA);
+        if (dmaBuffer)
+        {
+            // _IOFBF: 完全バッファリング、LOG_BUFFER_SIZE: バッファサイズ
+            setvbuf(fp, dmaBuffer, _IOFBF, LOG_BUFFER_SIZE);
+            ESP_LOGI("SDMMC", "Enabled DMA buffer for file (size=%d)", LOG_BUFFER_SIZE);
+        }
+        else
+        {
+            ESP_LOGW("SDMMC", "Failed to alloc DMA buffer. Using default buffer.");
+        }
+
+        // CSVヘッダ等を書いておく
         fprintf(fp, "timestamp(us),x-gyro,y-gyro,z-gyro,roll,pitch,yaw\n");
 
         return true;
     }
 
-    /**
-     * @brief end() - ログファイルをクローズ＆アンマウント
-     */
     void end()
     {
         if (fp)
@@ -126,32 +128,35 @@ public:
             esp_vfs_fat_sdmmc_unmount();
             mounted = false;
         }
+        // 確保したバッファを解放
+        if (dmaBuffer)
+        {
+            heap_caps_free(dmaBuffer);
+            dmaBuffer = nullptr;
+        }
         ESP_LOGI("SDMMC", "Unmounted SD card");
     }
 
-    /**
-     * @brief writeLog() - ジャイロ、姿勢角をCSV形式でログ書き込み
-     * @param timestampUs   取得時刻(μs)
-     * @param xGyroRaw      x軸ジャイロ生データ
-     * @param yGyroRaw      y軸ジャイロ生データ
-     * @param zGyroRaw      z軸ジャイロ生データ
-     * @param rollDeg       ロール角度(deg)
-     * @param pitchDeg      ピッチ角度(deg)
-     * @param yawDeg        ヨー角度(deg)
-     */
+    // ログ書き込み
     void writeLog(uint64_t timestampUs,
                   int16_t xGyroRaw, int16_t yGyroRaw, int16_t zGyroRaw,
                   float rollDeg, float pitchDeg, float yawDeg)
     {
         if (!fp)
-        {
-            // 未オープンやエラー時は無視
             return;
-        }
         fprintf(fp, "%llu,%d,%d,%d,%.4f,%.4f,%.4f\n",
                 (long long unsigned)timestampUs,
                 xGyroRaw, yGyroRaw, zGyroRaw,
                 rollDeg, pitchDeg, yawDeg);
+    }
+
+    // fflush()のラッパ (必要に応じて呼び出し)
+    void flush()
+    {
+        if (fp)
+        {
+            fflush(fp);
+        }
     }
 };
 
