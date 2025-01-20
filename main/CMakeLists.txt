@@ -9,5 +9,6 @@ idf_component_register(
                  "icm42688"
                  "gptimer"
                  "Quaternion"
+                 "SdmmcLogger"
     REQUIRES driver esp_timer log sdmmc fatfs
 )
