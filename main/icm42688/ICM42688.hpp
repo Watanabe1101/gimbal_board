@@ -3,7 +3,7 @@
 
 #ifndef ICM_H
 #define ICM_H
-#include "SPICREATE.h" // 2.0.0
+#include "SPICREATE.hpp" // 3.0.0
 
 #define POWER_MANAGEMENT 0x4E
 #define WHO_AM_I_Address 0x75

@@ -9,13 +9,13 @@
 #include "esp_system.h"
 
 // SPI & IMU
-#include "SPICREATE.h"
-#include "ICM42688.h" // ユーザ定義IMUライブラリ
-#include "gptimer.h"
-#include "SimpleQuat.h"
+#include "SPICREATE.hpp"
+#include "ICM42688.hpp" // ユーザ定義IMUライブラリ
+#include "gptimer.hpp"
+#include "SimpleQuat.hpp"
 
 // SDMMC Logger (バッファリング対応版を使用してください)
-#include "SdmmcLogger.h"
+#include "SdmmcLogger.hpp"
 
 #define TIMER_RESOLUTION_HZ (1000 * 1000) // 1MHz
 #define TIMER_ALARM_COUNT (1000)          // 1000ticks = 1ms(=1kHz)

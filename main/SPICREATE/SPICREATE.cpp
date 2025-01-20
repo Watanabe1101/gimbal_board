@@ -1,5 +1,5 @@
 // version: 2.0.0
-#include "SPICREATE.h" // 2.0.0
+#include "SPICREATE.hpp" // 2.0.0
 
 bool SPICreate::begin(spi_host_device_t host_in, int sck, int miso, int mosi, uint32_t f)
 {
@@ -10,14 +10,16 @@ bool SPICreate::begin(spi_host_device_t host_in, int sck, int miso, int mosi, ui
     bus_cfg.mosi_io_num = (mosi < 0) ? 13 : mosi;
     bus_cfg.max_transfer_sz = max_size;
 
-    if (mode != 1 && mode != 3) {
+    if (mode != 1 && mode != 3)
+    {
         mode = 3;
     }
 
-    host = host_in; 
+    host = host_in;
 
     esp_err_t e = spi_bus_initialize(host, &bus_cfg, SPI_DMA_CH_AUTO);
-    if (e != ESP_OK) {
+    if (e != ESP_OK)
+    {
         ESP_LOGE("SPICreate", "SPI bus initialize failed : %d", e);
         return false;
     }
@@ -41,14 +43,16 @@ int SPICreate::addDevice(spi_device_interface_config_t *if_cfg, int cs)
 
     if_cfg->spics_io_num = cs;
 
-    if (deviceNum > 2) {
+    if (deviceNum > 2)
+    {
         ESP_LOGE("SPICreate", "Device number over");
         return 0; // handle[0..2]までしか用意していないので
     }
 
     // デバイス追加
     esp_err_t e = spi_bus_add_device(host, if_cfg, &handle[deviceNum]);
-    if (e != ESP_OK) {
+    if (e != ESP_OK)
+    {
         return 0;
     }
     return deviceNum;
