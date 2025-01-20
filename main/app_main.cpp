@@ -33,7 +33,7 @@ extern "C" void app_main(void)
     // 1) SDMMCホストの設定
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
     // High Speedモード(40 MHz)を使うため設定
-    host.max_freq_khz = SDMMC_FREQ_HIGHSPEED; // 40 MHz
+    host.max_freq_khz = SDMMC_FREQ_DEFAULT; // 40 MHz
 
     // 2) スロット設定
     sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
@@ -55,7 +55,7 @@ extern "C" void app_main(void)
     // 3) SDカードをVFSにマウント
     //    mount_config でマウント時の動作を制御
     esp_vfs_fat_sdmmc_mount_config_t mount_config = {
-        .format_if_mount_failed = false,   // マウントに失敗してもフォーマットしない
+        .format_if_mount_failed = true,    // マウントに失敗してもフォーマットしない
         .max_files = 5,                    // 同時オープンできるファイル数
         .allocation_unit_size = 16 * 1024, // FATのアロケーション単位(パフォーマンス調整用)
         .disk_status_check_enable = false};
@@ -86,7 +86,7 @@ extern "C" void app_main(void)
     }
     else
     {
-        fprintf(f, "Hello SD card from ESP32-S3 at 40 MHz!\n");
+        fprintf(f, "Hello SD card from ESP32-S3 at 20 MHz!\n");
         fclose(f);
         ESP_LOGI(TAG, "File written: %s", filePath);
     }
