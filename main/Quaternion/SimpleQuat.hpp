@@ -140,6 +140,18 @@ public:
         euler_rad[2] = yaw;
     }
 
+    /**
+     * @brief 現在のクォータニオン (w, x, y, z) を取得
+     * @param quat_out [out] float配列[4] へクォータニオンを格納
+     */
+    void GetQuarternion(float quat_out[4]) const
+    {
+        quat_out[0] = q_[0]; // w
+        quat_out[1] = q_[1]; // x
+        quat_out[2] = q_[2]; // y
+        quat_out[3] = q_[3]; // z
+    }
+
 private:
     float q_[4];              ///< クォータニオン (w, x, y, z)
     float gyro_scale_factor_; ///< 生データ(int16)→[rad/s]変換係数
