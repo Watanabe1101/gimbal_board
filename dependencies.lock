@@ -1,4 +1,67 @@
 dependencies:
+  espressif/arduino-foc:
+    component_hash: 043f369595cdbb18e6f1745d279ae23d9ee87e211c4da4a9ffcd721176ac827b
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=4.4'
+    source:
+      registry_url: https://components.espressif.com
+      type: service
+    version: 2.3.0~3
+  espressif/cmake_utilities:
+    component_hash: 351350613ceafba240b761b4ea991e0f231ac7a9f59a9ee901f751bddc0bb18f
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=4.1'
+    source:
+      registry_url: https://components.espressif.com
+      type: service
+    version: 0.5.3
+  espressif/esp_simplefoc:
+    component_hash: bb7c303cc2d48f8c3f907e396e616db280128e639c4c1165bc5f12ba6230f1ad
+    dependencies:
+    - name: espressif/arduino-foc
+      registry_url: https://components.espressif.com
+      require: public
+      version: '>=2.3.0~3'
+    - name: espressif/iqmath
+      registry_url: https://components.espressif.com
+      require: private
+      version: ^1.11.0
+    - name: espressif/i2c_bus
+      registry_url: https://components.espressif.com
+      require: public
+      version: 1.*
+    - name: idf
+      require: private
+      version: '>=5.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    targets:
+    - esp32
+    - esp32s2
+    - esp32s3
+    - esp32c3
+    - esp32c6
+    - esp32h2
+    version: 1.2.0
+  espressif/i2c_bus:
+    component_hash: 6863a42e6598b3057ecf227c550aeaecce66d14d7a9c64bc2eff484befcb5207
+    dependencies:
+    - name: espressif/cmake_utilities
+      registry_url: https://components.espressif.com
+      require: private
+      version: 0.*
+    - name: idf
+      require: private
+      version: '>=4.0'
+    source:
+      registry_url: https://components.espressif.com
+      type: service
+    version: 1.2.0
   espressif/iqmath:
     component_hash: 407d5bc3fd358a73d2b09982918ab508b4e804cc547942c5979d226be86b7e75
     dependencies:
@@ -14,8 +77,9 @@ dependencies:
       type: idf
     version: 5.4.0
 direct_dependencies:
+- espressif/esp_simplefoc
 - espressif/iqmath
 - idf
-manifest_hash: 60caa3792b88c2ff38dbb71bb1ca18caad8a78342ade8d9f1c71470699309bb1
+manifest_hash: d36e8fe849d04ce97113198472397b6683ad54a7254d42ec066d04564f2d8339
 target: esp32s3
 version: 2.0.0
