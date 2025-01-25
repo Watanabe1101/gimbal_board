@@ -19,11 +19,12 @@ struct CanRxFrame
 // 送信基板ID(上位3bit)の定義
 enum class BoardID : uint8_t
 {
-    COMMUNICATION = 0b000, // 通信基板
-    PARA = 0b001,          // 開放基板
-    POWER = 0b010,         // 電源管理基板
-    GIMBAL = 0b100,        // ジンバル基板
-    CAMERA = 0b100,        // カメラ基板
+    COM = 0b000,     // 通信基板
+    PARA = 0b001,    // 開放基板
+    POWER = 0b010,   // 電源管理基板
+    GIMBAL = 0b011,  // ジンバル基板
+    CAMERA = 0b100,  // カメラ基板
+    UNKNOWN = 0b111, // 不明
 };
 
 // 通信内容ID(下位8bit)の定義
