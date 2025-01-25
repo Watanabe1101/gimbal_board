@@ -3,19 +3,6 @@
 
 #include <cstdint>
 
-/**
- * @brief 受信データを受け取る際の構造体
- * @param id: 11bit標準ID
- * @param dlc: データ長
- * @param data: 受信データ
- */
-struct CanRxFrame
-{
-    uint16_t id; ///< 11bit標準ID
-    uint8_t dlc;
-    uint8_t data[8];
-};
-
 // 送信基板ID(上位3bit)の定義
 enum class BoardID : uint8_t
 {
@@ -36,6 +23,19 @@ enum class ContentID : uint8_t
     LIFTOFF_APOGEE = 0x03,  // 離床 or 頂点検知通知
     VOLTAGE = 0x04,         // 電圧送信
     QUATERNION = 0x05,      // クオータニオン送信
+};
+
+/**
+ * @brief 受信データを受け取る際の構造体
+ * @param dlc: データ長
+ * @param data: 受信データ
+ */
+struct CanRxFrame
+{
+    BoardID sender_board_id;
+    ContentID content_id;
+    uint8_t dlc;
+    uint8_t data[8];
 };
 
 // モード遷移コマンド(通信内容ID:0x00)

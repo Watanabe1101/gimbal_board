@@ -1,6 +1,4 @@
-#pragma once
-
-#include "CanComm.h"
+#include "CanComm.hpp"
 #include <cstring>
 
 //---------------------------------------
@@ -22,14 +20,14 @@ void CanComm::parseStdId(uint16_t sid, BoardID &bOut, ContentID &cOut)
 
 //---------------------------------------
 // コンストラクタ
-//---------------------------------------
+//---------------------------------------a
 CanComm::CanComm(BoardID self_board_id,
                  int tx_gpio,
                  int rx_gpio,
                  BoardID filter_board1,
                  BoardID filter_board2,
                  uint32_t tx_queue_len,
-                 uint32_t rx_queue_len, )
+                 uint32_t rx_queue_len)
     : self_board_id_(self_board_id),
       fb1_(filter_board1),
       fb2_(filter_board2),
@@ -47,8 +45,7 @@ CanComm::CanComm(BoardID self_board_id,
         .rx_queue_len = rx_queue_len,
         .alerts_enabled = TWAI_ALERT_RX_DATA | TWAI_ALERT_BUS_OFF,
         .clkout_divider = 0,
-        .intr_flags = ESP_INTR_FLAG_LOWMED,
-        .sleep_allow_pd = 0};
+        .intr_flags = ESP_INTR_FLAG_LOWMED};
 
     t_config_ = TWAI_TIMING_CONFIG_500KBITS();
 
@@ -196,7 +193,7 @@ void CanComm::setupFilter()
     {
         f_config_.single_filter = false;
 
-        auto encodeBoard = [&](CanBoardID b)
+        auto encodeBoard = [&](BoardID b)
         {
             return static_cast<uint16_t>((static_cast<uint8_t>(b) & 0x07) << 8);
         };

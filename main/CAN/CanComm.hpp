@@ -29,10 +29,10 @@ public:
     CanComm(BoardID self_board_id,
             int tx_gpio,
             int rx_gpio,
-            BoardID filter_board1 = CanBoardID::UNKNOWN,
-            BoardID filter_board2 = CanBoardID::UNKNOWN,
+            BoardID filter_board1 = BoardID::UNKNOWN,
+            BoardID filter_board2 = BoardID::UNKNOWN,
             uint32_t tx_queue_len = 10,
-            uint32_t rx_queue_len = 10, );
+            uint32_t rx_queue_len = 10);
 
     /**
      * @brief ドライバインストール & スタート

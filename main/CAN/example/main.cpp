@@ -58,10 +58,9 @@ extern "C" void app_main(void)
                     if (e == ESP_OK)
                     {
                         // 受信成功
-                        printf("[MAIN] Rx from Board=%d, Content=0x%02X, dlc=%d\n",
-                               (int)rx.sender_board_id,
-                               (int)rx.content_id,
-                               rx.dlc);
+                        printf("[MAIN] ID=%d, dlc=%d\n",
+                               (int)rx.id,
+                               (int)rx.dlc);
                     }
                     else if (e == ESP_ERR_TIMEOUT)
                     {
