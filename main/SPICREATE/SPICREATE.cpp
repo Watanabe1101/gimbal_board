@@ -43,7 +43,7 @@ int SPICreate::addDevice(spi_device_interface_config_t *if_cfg, int cs)
 
     if_cfg->spics_io_num = cs;
 
-    if (deviceNum > 2)
+    if (deviceNum > 4)
     {
         ESP_LOGE("SPICreate", "Device number over");
         return 0; // handle[0..2]までしか用意していないので

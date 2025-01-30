@@ -3,6 +3,7 @@ idf_component_register(
          "svpwm/esp_svpwm.c" 
          "foc/esp_foc.c"
          "SPICREATE/SPICREATE.cpp"
+         "CAN/CanComm.cpp"
     INCLUDE_DIRS "svpwm" 
                  "foc"
                  "SPICREATE"
@@ -10,5 +11,6 @@ idf_component_register(
                  "gptimer"
                  "Quaternion"
                  "SdmmcLogger"
+                 "CAN"
     REQUIRES driver esp_timer log sdmmc fatfs
 )
