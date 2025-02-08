@@ -152,6 +152,18 @@ public:
         quat_out[3] = q_[3]; // z
     }
 
+    /**
+     * @brief 現在のクォータニオン (w, x, y, z) int16で取得
+     * @param quat_out [out] int16配列[4] へクォータニオンを格納
+     */
+    void GetScaledQuarternion(int16_t quat_out[4]) const
+    {
+        for (int i = 0; i < 4; i++)
+        {
+            quat_out[i] = (int16_t)(q_[i] * 32767.0f);
+        }
+    }
+
 private:
     float q_[4];              ///< クォータニオン (w, x, y, z)
     float gyro_scale_factor_; ///< 生データ(int16)→[rad/s]変換係数
