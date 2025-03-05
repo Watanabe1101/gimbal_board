@@ -9,13 +9,16 @@
 #include "esp_system.h"
 
 // SPI & IMU
-#include "SPICREATE.h"
-#include "ICM42688.h" // ユーザ定義IMUライブラリ
-#include "gptimer.h"
-#include "SimpleQuat.h"
+#include "SPICREATE.hpp"
+#include "ICM42688.hpp" // ユーザ定義IMUライブラリ
+#include "gptimer.hpp"
+#include "SimpleQuat.hpp"
 
 // SDMMC Logger (バッファリング対応版を使用してください)
-#include "SdmmcLogger.h"
+#include "SdmmcLogger.hpp"
+
+// CAN通信
+#include "CanComm.hpp"
 
 #define TIMER_RESOLUTION_HZ (1000 * 1000) // 1MHz
 #define TIMER_ALARM_COUNT (1000)          // 1000ticks = 1ms(=1kHz)
@@ -27,6 +30,9 @@ typedef struct
     uint64_t timestamp_us;
 } sensor_data_t;
 
+// CAN通信の初期化
+CanComm CAN(BoardID::GIMBAL, GPIO_NUM_14, GPIO_NUM_13);
+
 // グローバル変数
 static QueueHandle_t g_sensorQueue = nullptr; // センサー生データ用キュー
 static SPICreate g_spi;                       // SPIクラス
@@ -36,6 +42,24 @@ static GPTimer g_gpt;                         // GPTimer
 
 // 角速度スケーリング係数 (ICM42688 ±2000dps相当)
 static constexpr float GYRO_SCALE_2000DPS = (1.0f / 16.4f) * (3.1415926535f / 180.0f);
+
+// -------------------------
+// モード管理用の定義
+// -------------------------
+enum class OperationMode
+{
+    START,       // 初期化時のモード。CANのみ動作、その他タスクは未起動／停止状態
+    PREPARATION, // センサ・ロギングタスクを動作
+    LOGGING      // 今後追加予定のタスクを動作（現状はPREPARATIONタスクはそのまま動作）
+};
+
+// グローバルモード変数（初期状態はSTART）
+static volatile OperationMode g_currentMode = OperationMode::START;
+
+// 各タスクのタスクハンドル（タスク生成時にセット）
+static TaskHandle_t sensorTaskHandle = nullptr;
+static TaskHandle_t loggingTaskHandle = nullptr;
+static TaskHandle_t canCommandTaskHandle = nullptr;
 
 // 割り込みコールバック(1kHz)
 static bool IRAM_ATTR sensorTimerCallback(gptimer_handle_t timer,
@@ -153,7 +177,7 @@ static void loggingTask(void *args)
     // 2-1. キャリブレーション
     // -----------------------------
     ESP_LOGI("loggingTask", "Start gyro bias calibration for 60sec...");
-    const int sample_count = 1000 * 60; // 60秒
+    const int sample_count = 1000 * 5; // 5秒
     float sumX = 0.0f, sumY = 0.0f, sumZ = 0.0f;
     int countSample = 0;
 
@@ -182,9 +206,15 @@ static void loggingTask(void *args)
     // 2-2. 通常ロギング
     // -----------------------------
     uint32_t printcount = 0; // コンソール出力用カウンタ
+
+    int16_t ScaledQuarternion[4] = {0};
+    uint8_t PackScaledQuarternion[8] = {0};
+    float Quartrenion[4] = {0};
+
     while (true)
     {
         sensor_data_t recvData;
+
         // センサデータを待つ
         if (xQueueReceive(g_sensorQueue, &recvData, portMAX_DELAY) == pdTRUE)
         {
@@ -211,11 +241,25 @@ static void loggingTask(void *args)
             // 100回に1回コンソールへ
             if (printcount++ == 100)
             {
-                g_sdCard.flush();
-                ESP_LOGI("loggingTask", "[%.2f ms] GYRO=(%d,%d,%d), EULER=(%.2f, %.2f, %.2f)",
+                g_sdCard.flush(); // sd flush
+                quat.GetScaledQuarternion(ScaledQuarternion);
+                quat.GetQuarternion(Quartrenion);
+                // ESP_LOGI("loggingTask", "[%.2f ms] GYRO=(%d,%d,%d), EULER=(%.2f, %.2f, %.2f)",
+                //          recvData.timestamp_us / 1000.0,
+                //          recvData.sensor[3], recvData.sensor[4], recvData.sensor[5],
+                //          roll_deg, pitch_deg, yaw_deg);
+                // can送信用にデータをパック
+                for (int i = 0; i < 4; i++)
+                {
+                    PackScaledQuarternion[i * 2] = (uint8_t)(ScaledQuarternion[i] & 0x00FF);
+                    PackScaledQuarternion[i * 2 + 1] = (uint8_t)((ScaledQuarternion[i] & 0xFF00) >> 8);
+                }
+                CAN.send(ContentID::QUATERNION, PackScaledQuarternion, 8);
+                ESP_LOGI("loggingTask", "[%.2f ms] Quarternion=(%d,%d,%d,%d), Quarternion=(%.2f, %.2f, %.2f, %.2f)",
                          recvData.timestamp_us / 1000.0,
-                         recvData.sensor[3], recvData.sensor[4], recvData.sensor[5],
-                         roll_deg, pitch_deg, yaw_deg);
+                         ScaledQuarternion[0], ScaledQuarternion[1], ScaledQuarternion[2], ScaledQuarternion[3],
+                         Quartrenion[0], Quartrenion[1], Quartrenion[2], Quartrenion[3]);
+
                 printcount = 0;
             }
         }
@@ -226,20 +270,114 @@ static void loggingTask(void *args)
     vTaskDelete(NULL);
 }
 
+// -------------------------
+// CANコマンド受信タスク
+// -------------------------
+// このタスクはCANバスからのモード遷移コマンドを受信し、
+// g_currentMode を更新するとともに、対応するタスクの起動／停止を行います。
+static void canCommandTask(void *args)
+{
+    ESP_LOGI("canCommandTask", "Starting CAN command task...");
+    CanRxFrame rxFrame;
+
+    while (true)
+    {
+        // 非ブロッキングでCANフレームを取得
+        if (CAN.readFrameNoWait(rxFrame) == ESP_OK)
+        {
+            if (rxFrame.content_id == ContentID::MODE_TRANSITION)
+            {
+                // 受信データの先頭1バイトにコマンド文字が入っている前提
+                char cmd = (char)rxFrame.data[0];
+                ESP_LOGI("canCommandTask", "Received mode command: %c", cmd);
+
+                // コマンドによりモード遷移
+                if (cmd == (char)ModeCommand::PREPARATION)
+                { // 'p'
+                    if (g_currentMode == OperationMode::START)
+                    {
+                        g_currentMode = OperationMode::PREPARATION;
+                        // センサタスクとロギングタスクの生成
+                        if (sensorTaskHandle == nullptr)
+                        {
+                            xTaskCreatePinnedToCore(sensorTask, "sensorTask", 4096, NULL, 5, &sensorTaskHandle, 1);
+                        }
+                        if (loggingTaskHandle == nullptr)
+                        {
+                            xTaskCreatePinnedToCore(loggingTask, "loggingTask", 4096, NULL, 5, &loggingTaskHandle, 1);
+                        }
+                        ESP_LOGI("canCommandTask", "Mode transition: START -> PREPARATION");
+                    }
+                }
+                else if (cmd == (char)ModeCommand::LOGGING)
+                { // 'l'
+                    if (g_currentMode == OperationMode::PREPARATION)
+                    {
+                        g_currentMode = OperationMode::LOGGING;
+                        // ※必要に応じて、logging mode専用タスクの起動処理などを追加
+                        ESP_LOGI("canCommandTask", "Mode transition: PREPARATION -> LOGGING");
+                    }
+                }
+                else if (cmd == (char)ModeCommand::START)
+                { // 's'
+                    if (g_currentMode == OperationMode::PREPARATION || g_currentMode == OperationMode::LOGGING)
+                    {
+                        g_currentMode = OperationMode::START;
+                        // 実行中のセンサタスク・ロギングタスクを停止（タスク削除）
+                        if (sensorTaskHandle != nullptr)
+                        {
+                            vTaskDelete(sensorTaskHandle);
+                            sensorTaskHandle = nullptr;
+                        }
+                        if (loggingTaskHandle != nullptr)
+                        {
+                            vTaskDelete(loggingTaskHandle);
+                            loggingTaskHandle = nullptr;
+                        }
+                        ESP_LOGI("canCommandTask", "Mode transition: PREPARATION/LOGGING -> START");
+                    }
+                }
+                else if (cmd == 'b')
+                {
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                    CAN.send(ContentID::BOARD_STATE, reinterpret_cast<const uint8_t *>("b"), 1);
+                }
+
+                else
+                {
+                    ESP_LOGW("canCommandTask", "Unknown mode command received: %c", cmd);
+                }
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(100)); // 少し待ってループ（busy loop回避）
+    }
+    vTaskDelete(NULL);
+}
+
 // -----------------------------
 // メイン (タスク生成)
 // -----------------------------
+// -------------------------
+// メイン (タスク生成)
+// -------------------------
 extern "C" void app_main(void)
 {
-    // センサータスク作成
-    xTaskCreatePinnedToCore(sensorTask, "sensorTask", 4096, NULL, 5, NULL, 1);
-    // ロギングタスク作成
-    xTaskCreatePinnedToCore(loggingTask, "loggingTask", 4096, NULL, 5, NULL, 1);
+    ESP_LOGI("app_main", "System starting in START mode...");
+    // CANドライバ初期化
+    if (CAN.begin() != ESP_OK)
+    {
+        ESP_LOGE("app_main", "CAN begin failed");
+        return;
+    }
 
-    // メインタスクは何もしない場合
-    // (不要なら vTaskDelete(NULL) で自滅しても可)
+    // CANコマンド受信用タスクを常時動作させる
+    xTaskCreatePinnedToCore(canCommandTask, "canCommandTask", 4096, NULL, 6, &canCommandTaskHandle, 1);
+
+    // ※初期モードはSTARTのため、センサ・ロギングタスクは生成せず、
+    //     CANからのモード遷移コマンドを待つ。
     while (1)
     {
         vTaskDelay(pdMS_TO_TICKS(1000));
+        ESP_LOGD("app_main", "Main loop in START mode...");
     }
 }
