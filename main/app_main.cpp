@@ -17,8 +17,18 @@
 // SDMMC Logger (バッファリング対応版を使用してください)
 #include "SdmmcLogger.hpp"
 
-// CAN通信
-#include "CanComm.hpp"
+// rollモーター
+#include "esp_simplefoc.h"
+
+/// @brief ピッチモーターの設定
+BLDCMotor motor1 = BLDCMotor(7);
+BLDCDriver3PWM driver1 = BLDCDriver3PWM(38, 45, 48);
+AS5048a sensor1(SPI3_HOST, (gpio_num_t)6, (gpio_num_t)4, (gpio_num_t)15, (gpio_num_t)39);
+
+/// @brief ロールモーターの設定
+static BLDCMotor motor2 = BLDCMotor(7); // 同様に7極ペア
+static BLDCDriver3PWM driver2 = BLDCDriver3PWM(10, 11, 12);
+AS5048a sensor2(SPI3_HOST, (gpio_num_t)6, (gpio_num_t)4, (gpio_num_t)15, (gpio_num_t)7);
 
 #define TIMER_RESOLUTION_HZ (1000 * 1000) // 1MHz
 #define TIMER_ALARM_COUNT (1000)          // 1000ticks = 1ms(=1kHz)
@@ -30,36 +40,22 @@ typedef struct
     uint64_t timestamp_us;
 } sensor_data_t;
 
-// CAN通信の初期化
-CanComm CAN(BoardID::GIMBAL, GPIO_NUM_14, GPIO_NUM_13);
-
 // グローバル変数
 static QueueHandle_t g_sensorQueue = nullptr; // センサー生データ用キュー
+static QueueHandle_t g_angleQueue = nullptr;  // 角度指示用キュー
 static SPICreate g_spi;                       // SPIクラス
 static ICM g_icm;                             // IMU
 static SdmmcLogger g_sdCard;                  // SDカードロガー
 static GPTimer g_gpt;                         // GPTimer
 
+// ------------------ 目標角(roll, pitch)共有用 ------------------
+static float roll_target = 0.0f;
+static float pitch_target = 0.0f;
+static SemaphoreHandle_t g_angleMutex = nullptr;
+// --------------------------------------------------------------
+
 // 角速度スケーリング係数 (ICM42688 ±2000dps相当)
 static constexpr float GYRO_SCALE_2000DPS = (1.0f / 16.4f) * (3.1415926535f / 180.0f);
-
-// -------------------------
-// モード管理用の定義
-// -------------------------
-enum class OperationMode
-{
-    START,       // 初期化時のモード。CANのみ動作、その他タスクは未起動／停止状態
-    PREPARATION, // センサ・ロギングタスクを動作
-    LOGGING      // 今後追加予定のタスクを動作（現状はPREPARATIONタスクはそのまま動作）
-};
-
-// グローバルモード変数（初期状態はSTART）
-static volatile OperationMode g_currentMode = OperationMode::START;
-
-// 各タスクのタスクハンドル（タスク生成時にセット）
-static TaskHandle_t sensorTaskHandle = nullptr;
-static TaskHandle_t loggingTaskHandle = nullptr;
-static TaskHandle_t canCommandTaskHandle = nullptr;
 
 // 割り込みコールバック(1kHz)
 static bool IRAM_ATTR sensorTimerCallback(gptimer_handle_t timer,
@@ -93,8 +89,8 @@ static void sensorTask(void *args)
     // 1. SPI初期化
     bool ret = g_spi.begin(
         SPI2_HOST,
-        (gpio_num_t)6,  // SCLK
-        (gpio_num_t)4,  // MISO
+        (gpio_num_t)8,  // SCLK
+        (gpio_num_t)16, // MISO
         (gpio_num_t)5,  // MOSI
         8 * 1000 * 1000 // 8MHz
     );
@@ -161,7 +157,7 @@ static void loggingTask(void *args)
 {
     // 1. SDカード初期化 (バッファリング対応)
     //    例: HighSpeed = false, mountPoint="/sdcard", logFile="/sdcard/gyro_log.csv"
-    bool useHighSpeed = false;
+    bool useHighSpeed = true;
     if (!g_sdCard.begin(useHighSpeed, "/sdcard", "/sdcard/gyro_log.csv"))
     {
         ESP_LOGE("loggingTask", "Failed to mount or open log file.");
@@ -177,7 +173,7 @@ static void loggingTask(void *args)
     // 2-1. キャリブレーション
     // -----------------------------
     ESP_LOGI("loggingTask", "Start gyro bias calibration for 60sec...");
-    const int sample_count = 1000 * 5; // 5秒
+    const int sample_count = 1000 * 6; // 60秒
     float sumX = 0.0f, sumY = 0.0f, sumZ = 0.0f;
     int countSample = 0;
 
@@ -206,15 +202,9 @@ static void loggingTask(void *args)
     // 2-2. 通常ロギング
     // -----------------------------
     uint32_t printcount = 0; // コンソール出力用カウンタ
-
-    int16_t ScaledQuarternion[4] = {0};
-    uint8_t PackScaledQuarternion[8] = {0};
-    float Quartrenion[4] = {0};
-
     while (true)
     {
         sensor_data_t recvData;
-
         // センサデータを待つ
         if (xQueueReceive(g_sensorQueue, &recvData, portMAX_DELAY) == pdTRUE)
         {
@@ -225,10 +215,26 @@ static void loggingTask(void *args)
             float euler[3];
             quat.getEulerRad(euler);
 
+            float target_angle = euler[0];
+            // // モーター指示
+            // if (g_angleQueue != nullptr)
+            // {
+            //     xQueueOverwrite(g_angleQueue, &target_angle);
+            // }
             // 度数法に変換
             float roll_deg = euler[0] * (180.0f / 3.1415926535f);
             float pitch_deg = euler[1] * (180.0f / 3.1415926535f);
             float yaw_deg = euler[2] * (180.0f / 3.1415926535f);
+
+            // -----------------------------
+            // ロール・ピッチを「目標角」として共有
+            // -----------------------------
+            if (g_angleMutex && xSemaphoreTake(g_angleMutex, 0) == pdTRUE)
+            {
+                roll_target = yaw_deg;
+                pitch_target = pitch_deg;
+                xSemaphoreGive(g_angleMutex);
+            }
 
             // ログファイルへ書き込み
             g_sdCard.writeLog(
@@ -241,25 +247,11 @@ static void loggingTask(void *args)
             // 100回に1回コンソールへ
             if (printcount++ == 100)
             {
-                g_sdCard.flush(); // sd flush
-                quat.GetScaledQuarternion(ScaledQuarternion);
-                quat.GetQuarternion(Quartrenion);
-                // ESP_LOGI("loggingTask", "[%.2f ms] GYRO=(%d,%d,%d), EULER=(%.2f, %.2f, %.2f)",
-                //          recvData.timestamp_us / 1000.0,
-                //          recvData.sensor[3], recvData.sensor[4], recvData.sensor[5],
-                //          roll_deg, pitch_deg, yaw_deg);
-                // can送信用にデータをパック
-                for (int i = 0; i < 4; i++)
-                {
-                    PackScaledQuarternion[i * 2] = (uint8_t)(ScaledQuarternion[i] & 0x00FF);
-                    PackScaledQuarternion[i * 2 + 1] = (uint8_t)((ScaledQuarternion[i] & 0xFF00) >> 8);
-                }
-                CAN.send(ContentID::QUATERNION, PackScaledQuarternion, 8);
-                ESP_LOGI("loggingTask", "[%.2f ms] Quarternion=(%d,%d,%d,%d), Quarternion=(%.2f, %.2f, %.2f, %.2f)",
+                g_sdCard.flush();
+                ESP_LOGI("loggingTask", "[%.2f ms] GYRO=(%d,%d,%d), EULER=(%.2f, %.2f, %.2f)",
                          recvData.timestamp_us / 1000.0,
-                         ScaledQuarternion[0], ScaledQuarternion[1], ScaledQuarternion[2], ScaledQuarternion[3],
-                         Quartrenion[0], Quartrenion[1], Quartrenion[2], Quartrenion[3]);
-
+                         recvData.sensor[3], recvData.sensor[4], recvData.sensor[5],
+                         roll_deg, pitch_deg, yaw_deg);
                 printcount = 0;
             }
         }
@@ -270,86 +262,66 @@ static void loggingTask(void *args)
     vTaskDelete(NULL);
 }
 
-// -------------------------
-// CANコマンド受信タスク
-// -------------------------
-// このタスクはCANバスからのモード遷移コマンドを受信し、
-// g_currentMode を更新するとともに、対応するタスクの起動／停止を行います。
-static void canCommandTask(void *args)
+// -----------------------------
+// 角度制御タスク (モータ2ch)
+// -----------------------------
+#define USING_MCPWM
+static void angleControlTask(void *args)
 {
-    ESP_LOGI("canCommandTask", "Starting CAN command task...");
-    CanRxFrame rxFrame;
+    // 1. ドライバ初期化 & モータ設定
+    sensor1.init();
+    motor1.linkSensor(&sensor1);
+    driver1.voltage_power_supply = 7;
+    driver1.voltage_limit = 4;
+    driver1.init(0); // MCPWMユニット0
+    motor1.linkDriver(&driver1);
+    motor1.controller = MotionControlType::angle;
+    motor1.velocity_limit = 100.0; // [rad/s]上限
+    motor1.voltage_limit = 4.0;
+    motor1.init();
+    motor1.initFOC();
 
+    driver2.voltage_power_supply = 7;
+    driver2.voltage_limit = 4;
+    driver2.init(1); // MCPWMユニット1
+    sensor2.init();
+    motor2.linkSensor(&sensor2);
+    motor2.linkDriver(&driver2);
+    motor2.controller = MotionControlType::angle;
+    motor2.velocity_limit = 100.0;
+    motor2.voltage_limit = 6.0;
+    motor2.init();
+    motor2.initFOC();
+
+    ESP_LOGI("angleControlTask", "Motors initialized (open-loop angle).");
+
+    // 角度更新のダウンサンプリング
+    int16_t downsample_counter = 10;
     while (true)
     {
-        // 非ブロッキングでCANフレームを取得
-        if (CAN.readFrameNoWait(rxFrame) == ESP_OK)
+        float local_roll = 0.0f;
+        float local_pitch = 0.0f;
+
+        // ミューテックスで共有データを取得
+        if (g_angleMutex && xSemaphoreTake(g_angleMutex, pdMS_TO_TICKS(1)) == pdTRUE)
         {
-            if (rxFrame.content_id == ContentID::MODE_TRANSITION)
-            {
-                // 受信データの先頭1バイトにコマンド文字が入っている前提
-                char cmd = (char)rxFrame.data[0];
-                ESP_LOGI("canCommandTask", "Received mode command: %c", cmd);
-
-                // コマンドによりモード遷移
-                if (cmd == (char)ModeCommand::PREPARATION)
-                { // 'p'
-                    if (g_currentMode == OperationMode::START)
-                    {
-                        g_currentMode = OperationMode::PREPARATION;
-                        // センサタスクとロギングタスクの生成
-                        if (sensorTaskHandle == nullptr)
-                        {
-                            xTaskCreatePinnedToCore(sensorTask, "sensorTask", 4096, NULL, 5, &sensorTaskHandle, 1);
-                        }
-                        if (loggingTaskHandle == nullptr)
-                        {
-                            xTaskCreatePinnedToCore(loggingTask, "loggingTask", 4096, NULL, 5, &loggingTaskHandle, 1);
-                        }
-                        ESP_LOGI("canCommandTask", "Mode transition: START -> PREPARATION");
-                    }
-                }
-                else if (cmd == (char)ModeCommand::LOGGING)
-                { // 'l'
-                    if (g_currentMode == OperationMode::PREPARATION)
-                    {
-                        g_currentMode = OperationMode::LOGGING;
-                        // ※必要に応じて、logging mode専用タスクの起動処理などを追加
-                        ESP_LOGI("canCommandTask", "Mode transition: PREPARATION -> LOGGING");
-                    }
-                }
-                else if (cmd == (char)ModeCommand::START)
-                { // 's'
-                    if (g_currentMode == OperationMode::PREPARATION || g_currentMode == OperationMode::LOGGING)
-                    {
-                        g_currentMode = OperationMode::START;
-                        // 実行中のセンサタスク・ロギングタスクを停止（タスク削除）
-                        if (sensorTaskHandle != nullptr)
-                        {
-                            vTaskDelete(sensorTaskHandle);
-                            sensorTaskHandle = nullptr;
-                        }
-                        if (loggingTaskHandle != nullptr)
-                        {
-                            vTaskDelete(loggingTaskHandle);
-                            loggingTaskHandle = nullptr;
-                        }
-                        ESP_LOGI("canCommandTask", "Mode transition: PREPARATION/LOGGING -> START");
-                    }
-                }
-                else if (cmd == 'b')
-                {
-                    vTaskDelay(pdMS_TO_TICKS(100));
-                    CAN.send(ContentID::BOARD_STATE, reinterpret_cast<const uint8_t *>("b"), 1);
-                }
-
-                else
-                {
-                    ESP_LOGW("canCommandTask", "Unknown mode command received: %c", cmd);
-                }
-            }
+            local_roll = roll_target;
+            local_pitch = pitch_target;
+            xSemaphoreGive(g_angleMutex);
         }
-        vTaskDelay(pdMS_TO_TICKS(100)); // 少し待ってループ（busy loop回避）
+
+        // deg→rad
+        float target_angle_roll = local_roll * 3.1415926535f / 180.0f;
+        float target_angle_pitch = local_pitch * 3.1415926535f / 180.0f;
+
+        // モータ1,2 それぞれ角度指令を与える（オープンループ）
+        motor1.loopFOC();
+        motor2.loopFOC();
+        motor1.move(target_angle_pitch);
+        motor2.move(target_angle_roll);
+
+        // ループ周期 (約1kHz)
+        vTaskDelay(1);
     }
     vTaskDelete(NULL);
 }
@@ -357,27 +329,21 @@ static void canCommandTask(void *args)
 // -----------------------------
 // メイン (タスク生成)
 // -----------------------------
-// -------------------------
-// メイン (タスク生成)
-// -------------------------
 extern "C" void app_main(void)
 {
-    ESP_LOGI("app_main", "System starting in START mode...");
-    // CANドライバ初期化
-    if (CAN.begin() != ESP_OK)
-    {
-        ESP_LOGE("app_main", "CAN begin failed");
-        return;
-    }
+    // 目標角共有用ミューテックス
+    g_angleMutex = xSemaphoreCreateMutex();
 
-    // CANコマンド受信用タスクを常時動作させる
-    xTaskCreatePinnedToCore(canCommandTask, "canCommandTask", 4096, NULL, 6, &canCommandTaskHandle, 1);
+    // センサータスク作成
+    xTaskCreatePinnedToCore(sensorTask, "sensorTask", 4096, NULL, 5, NULL, 1);
+    // ロギングタスク作成
+    xTaskCreatePinnedToCore(loggingTask, "loggingTask", 4096, NULL, 5, NULL, 1);
 
-    // ※初期モードはSTARTのため、センサ・ロギングタスクは生成せず、
-    //     CANからのモード遷移コマンドを待つ。
+    xTaskCreatePinnedToCore(angleControlTask, "angleControlTask", 8192, NULL, 6, NULL, 0);
+    // メインタスクは何もしない場合
+    // (不要なら vTaskDelete(NULL) で自滅しても可)
     while (1)
     {
         vTaskDelay(pdMS_TO_TICKS(1000));
-        ESP_LOGD("app_main", "Main loop in START mode...");
     }
 }
