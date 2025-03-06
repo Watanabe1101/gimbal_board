@@ -157,7 +157,7 @@ static void loggingTask(void *args)
 {
     // 1. SDカード初期化 (バッファリング対応)
     //    例: HighSpeed = false, mountPoint="/sdcard", logFile="/sdcard/gyro_log.csv"
-    bool useHighSpeed = true;
+    bool useHighSpeed = false;
     if (!g_sdCard.begin(useHighSpeed, "/sdcard", "/sdcard/gyro_log.csv"))
     {
         ESP_LOGE("loggingTask", "Failed to mount or open log file.");
@@ -317,8 +317,17 @@ static void angleControlTask(void *args)
         // モータ1,2 それぞれ角度指令を与える（オープンループ）
         motor1.loopFOC();
         motor2.loopFOC();
-        motor1.move(target_angle_pitch);
-        motor2.move(target_angle_roll);
+        if (downsample_counter-- <= 0)
+        {
+            motor1.move(target_angle_roll);
+            motor2.move(target_angle_pitch);
+            downsample_counter = 10;
+        }
+        else
+        {
+            motor1.move();
+            motor2.move();
+        }
 
         // ループ周期 (約1kHz)
         vTaskDelay(1);
