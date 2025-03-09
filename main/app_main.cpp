@@ -20,6 +20,8 @@
 // rollモーター
 #include "esp_simplefoc.h"
 
+#include "CanComm.hpp"
+
 /// @brief ピッチモーターの設定
 BLDCMotor motor1 = BLDCMotor(7);
 BLDCDriver3PWM driver1 = BLDCDriver3PWM(38, 45, 48);
@@ -29,6 +31,9 @@ AS5048a sensor1(SPI3_HOST, (gpio_num_t)6, (gpio_num_t)4, (gpio_num_t)15, (gpio_n
 static BLDCMotor motor2 = BLDCMotor(7); // 同様に7極ペア
 static BLDCDriver3PWM driver2 = BLDCDriver3PWM(10, 11, 12);
 AS5048a sensor2(SPI3_HOST, (gpio_num_t)6, (gpio_num_t)4, (gpio_num_t)15, (gpio_num_t)7);
+
+// CANインスタンス作成
+CanComm CAN(BoardID::GIMBAL, GPIO_NUM_14, GPIO_NUM_13);
 
 #define TIMER_RESOLUTION_HZ (1000 * 1000) // 1MHz
 #define TIMER_ALARM_COUNT (1000)          // 1000ticks = 1ms(=1kHz)
@@ -202,6 +207,12 @@ static void loggingTask(void *args)
     // 2-2. 通常ロギング
     // -----------------------------
     uint32_t printcount = 0; // コンソール出力用カウンタ
+
+    // クオータニオン送信関連
+    int16_t ScaledQuarternion[4] = {0};
+    uint8_t PackScaledQuarternion[8] = {0};
+    float Quartrenion[4] = {0};
+
     while (true)
     {
         sensor_data_t recvData;
@@ -232,7 +243,7 @@ static void loggingTask(void *args)
             if (g_angleMutex && xSemaphoreTake(g_angleMutex, 0) == pdTRUE)
             {
                 roll_target = yaw_deg;
-                pitch_target = pitch_deg;
+                pitch_target = roll_deg;
                 xSemaphoreGive(g_angleMutex);
             }
 
@@ -253,6 +264,14 @@ static void loggingTask(void *args)
                          recvData.sensor[3], recvData.sensor[4], recvData.sensor[5],
                          roll_deg, pitch_deg, yaw_deg);
                 printcount = 0;
+                quat.GetScaledQuarternion(ScaledQuarternion);
+                quat.GetQuarternion(Quartrenion);
+                for (int i = 0; i < 4; i++)
+                {
+                    PackScaledQuarternion[i * 2] = (uint8_t)(ScaledQuarternion[i] & 0x00FF);
+                    PackScaledQuarternion[i * 2 + 1] = (uint8_t)((ScaledQuarternion[i] & 0xFF00) >> 8);
+                }
+                CAN.send(ContentID::QUATERNION, PackScaledQuarternion, 8);
             }
         }
     }
@@ -268,6 +287,11 @@ static void loggingTask(void *args)
 #define USING_MCPWM
 static void angleControlTask(void *args)
 {
+
+    // モーター初期位置(組み立て依存)
+    float initial_roll = 0.0f;
+    float initial_pitch = 2.05f;
+
     // 1. ドライバ初期化 & モータ設定
     sensor1.init();
     motor1.linkSensor(&sensor1);
@@ -295,8 +319,20 @@ static void angleControlTask(void *args)
 
     ESP_LOGI("angleControlTask", "Motors initialized (open-loop angle).");
 
+    motor1.move(initial_pitch);
+    motor2.move(initial_roll);
+
     // 角度更新のダウンサンプリング
-    int16_t downsample_counter = 10;
+    int16_t downsample_counter = 1;
+    // 0.1度以上の角度差があれば更新
+    float target_roll_prev = 0.0f;
+    float target_pitch_prev = 0.0f;
+
+    // ロール角のラップアラウンド処理用の変数
+    float roll_unwrapped = 0.0f; // ±180°の制限なしに展開した角度
+    float roll_prev = 0.0f;      // 前回の角度値（±180°範囲内）
+    bool first_update = true;    // 初回更新フラグ
+
     while (true)
     {
         float local_roll = 0.0f;
@@ -305,9 +341,37 @@ static void angleControlTask(void *args)
         // ミューテックスで共有データを取得
         if (g_angleMutex && xSemaphoreTake(g_angleMutex, pdMS_TO_TICKS(1)) == pdTRUE)
         {
-            local_roll = roll_target;
-            local_pitch = pitch_target;
+            local_roll = -roll_target;
+            local_pitch = -pitch_target;
             xSemaphoreGive(g_angleMutex);
+        }
+
+        // ロール角の連続化処理（±180°境界を越える際の処理）
+        if (first_update)
+        {
+            // 初回は値を初期化
+            roll_unwrapped = local_roll;
+            roll_prev = local_roll;
+            first_update = false;
+        }
+        else
+        {
+            // ロール角の差分を計算
+            float roll_diff = local_roll - roll_prev;
+            // 180度境界をまたいだ場合の処理
+            if (roll_diff < -270.0f)
+            {
+                roll_diff += 360.0f;
+            }
+            else if (roll_diff > 270.0f)
+            {
+                roll_diff -= 360.0f;
+            }
+
+            // 展開角度を更新
+            roll_unwrapped += roll_diff;
+            roll_prev = local_roll;
+            local_roll = roll_unwrapped;
         }
 
         // deg→rad
@@ -319,8 +383,26 @@ static void angleControlTask(void *args)
         motor2.loopFOC();
         if (downsample_counter-- <= 0)
         {
-            motor1.move(target_angle_roll);
-            motor2.move(target_angle_pitch);
+            // ロールモーターの更新
+            if (fabs(target_angle_roll - target_roll_prev) > 0.01f)
+            {
+                target_roll_prev = target_angle_roll;
+                motor2.move(target_angle_roll + initial_roll);
+            }
+            else
+            {
+                motor2.move();
+            }
+            // ピッチモーターの更新
+            if (fabs(target_angle_pitch - target_pitch_prev) > 0.01f)
+            {
+                target_pitch_prev = target_angle_pitch;
+                motor1.move(target_angle_pitch + initial_pitch);
+            }
+            else
+            {
+                motor1.move();
+            }
             downsample_counter = 10;
         }
         else
@@ -328,7 +410,6 @@ static void angleControlTask(void *args)
             motor1.move();
             motor2.move();
         }
-
         // ループ周期 (約1kHz)
         vTaskDelay(1);
     }
@@ -340,17 +421,11 @@ static void angleControlTask(void *args)
 // -----------------------------
 extern "C" void app_main(void)
 {
-    // 目標角共有用ミューテックス
     g_angleMutex = xSemaphoreCreateMutex();
 
-    // センサータスク作成
     xTaskCreatePinnedToCore(sensorTask, "sensorTask", 4096, NULL, 5, NULL, 1);
-    // ロギングタスク作成
     xTaskCreatePinnedToCore(loggingTask, "loggingTask", 4096, NULL, 5, NULL, 1);
-
     xTaskCreatePinnedToCore(angleControlTask, "angleControlTask", 8192, NULL, 6, NULL, 0);
-    // メインタスクは何もしない場合
-    // (不要なら vTaskDelete(NULL) で自滅しても可)
     while (1)
     {
         vTaskDelay(pdMS_TO_TICKS(1000));
