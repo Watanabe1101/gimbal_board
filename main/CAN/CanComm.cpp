@@ -47,7 +47,7 @@ CanComm::CanComm(BoardID self_board_id,
         .clkout_divider = 0,
         .intr_flags = ESP_INTR_FLAG_LOWMED};
 
-    t_config_ = TWAI_TIMING_CONFIG_500KBITS();
+    t_config_ = TWAI_TIMING_CONFIG_1MBITS();
 
     f_config_ = TWAI_FILTER_CONFIG_ACCEPT_ALL();
 }

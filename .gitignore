@@ -5,7 +5,6 @@ idf.py
 CMakeFiles/
 CMakeCache.txt
 img/
-managed_components/
 
 # IDE specific files
 .vscode/

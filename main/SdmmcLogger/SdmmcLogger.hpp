@@ -112,7 +112,7 @@ public:
         }
 
         // CSVヘッダ等を書いておく
-        fprintf(fp, "timestamp(us),x-gyro,y-gyro,z-gyro,roll,pitch,yaw\n");
+        fprintf(fp, "timestamp(us),x-gyro,y-gyro,z-gyro,roll,pitch,yaw,roll_enc,roll_target,pitch_enc,pitch_target\n");
 
         return true;
     }
@@ -141,14 +141,17 @@ public:
     // ログ書き込み
     void writeLog(uint64_t timestampUs,
                   int16_t xGyroRaw, int16_t yGyroRaw, int16_t zGyroRaw,
-                  float rollDeg, float pitchDeg, float yawDeg)
+                  float rollDeg, float pitchDeg, float yawDeg,
+                  float rollEncDeg = 0.0f, float rollTargetDeg = 0.0f,
+                  float pitchEncDeg = 0.0f, float pitchTargetDeg = 0.0f)
     {
         if (!fp)
             return;
-        fprintf(fp, "%llu,%d,%d,%d,%.4f,%.4f,%.4f\n",
+        fprintf(fp, "%llu,%d,%d,%d,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n",
                 (long long unsigned)timestampUs,
                 xGyroRaw, yGyroRaw, zGyroRaw,
-                rollDeg, pitchDeg, yawDeg);
+                rollDeg, pitchDeg, yawDeg,
+                rollEncDeg, rollTargetDeg, pitchEncDeg, pitchTargetDeg);
     }
 
     // fflush()のラッパ (必要に応じて呼び出し)

@@ -69,8 +69,8 @@ static void sensorTask(void *args)
     // 1. SPI初期化
     bool ret = g_spi.begin(
         SPI2_HOST,
-        (gpio_num_t)6,  // SCLK
-        (gpio_num_t)4,  // MISO
+        (gpio_num_t)8,  // SCLK
+        (gpio_num_t)16, // MISO
         (gpio_num_t)5,  // MOSI
         8 * 1000 * 1000 // 8MHz
     );
