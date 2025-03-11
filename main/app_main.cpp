@@ -45,6 +45,17 @@ typedef struct
     uint64_t timestamp_us;
 } sensor_data_t;
 
+typedef struct
+{
+    float roll_enc;     // ロールモーターのエンコーダ値
+    float roll_target;  // ロールの目標角
+    float pitch_enc;    // ピッチモーターのエンコーダ値
+    float pitch_target; // ピッチの目標角
+} motor_angles_t;
+
+static motor_angles_t g_motorAngles = {0.0f, 0.0f, 0.0f, 0.0f};
+static SemaphoreHandle_t g_motorAnglesMutex = nullptr;
+
 // グローバル変数
 static QueueHandle_t g_sensorQueue = nullptr; // センサー生データ用キュー
 static QueueHandle_t g_angleQueue = nullptr;  // 角度指示用キュー
@@ -227,11 +238,7 @@ static void loggingTask(void *args)
             quat.getEulerRad(euler);
 
             float target_angle = euler[0];
-            // // モーター指示
-            // if (g_angleQueue != nullptr)
-            // {
-            //     xQueueOverwrite(g_angleQueue, &target_angle);
-            // }
+
             // 度数法に変換
             float roll_deg = euler[0] * (180.0f / 3.1415926535f);
             float pitch_deg = euler[1] * (180.0f / 3.1415926535f);
@@ -247,13 +254,28 @@ static void loggingTask(void *args)
                 xSemaphoreGive(g_angleMutex);
             }
 
+            // モーター角度データを取得
+            float roll_enc = 0.0f, roll_target_deg = 0.0f;
+            float pitch_enc = 0.0f, pitch_target_deg = 0.0f;
+
+            if (g_motorAnglesMutex && xSemaphoreTake(g_motorAnglesMutex, 0) == pdTRUE)
+            {
+                roll_enc = g_motorAngles.roll_enc;
+                roll_target_deg = g_motorAngles.roll_target;
+                pitch_enc = g_motorAngles.pitch_enc;
+                pitch_target_deg = g_motorAngles.pitch_target;
+                xSemaphoreGive(g_motorAnglesMutex);
+            }
+
             // ログファイルへ書き込み
             g_sdCard.writeLog(
                 recvData.timestamp_us,
                 recvData.sensor[3],
                 recvData.sensor[4],
                 recvData.sensor[5],
-                roll_deg, pitch_deg, yaw_deg);
+                roll_deg, pitch_deg, yaw_deg,
+                roll_enc, roll_target_deg,
+                pitch_enc, pitch_target_deg);
 
             // 100回に1回コンソールへ
             if (printcount++ == 100)
@@ -289,14 +311,14 @@ static void angleControlTask(void *args)
 {
 
     // モーター初期位置(組み立て依存)
-    float initial_roll = 0.0f;
+    float initial_roll = -0.2f;
     float initial_pitch = 2.05f;
 
     // 1. ドライバ初期化 & モータ設定
     sensor1.init();
     motor1.linkSensor(&sensor1);
-    driver1.voltage_power_supply = 7;
-    driver1.voltage_limit = 4;
+    driver1.voltage_power_supply = 12;
+    driver1.voltage_limit = 6;
     driver1.init(0); // MCPWMユニット0
     motor1.linkDriver(&driver1);
     motor1.controller = MotionControlType::angle;
@@ -305,8 +327,8 @@ static void angleControlTask(void *args)
     motor1.init();
     motor1.initFOC();
 
-    driver2.voltage_power_supply = 7;
-    driver2.voltage_limit = 4;
+    driver2.voltage_power_supply = 12;
+    driver2.voltage_limit = 6;
     driver2.init(1); // MCPWMユニット1
     sensor2.init();
     motor2.linkSensor(&sensor2);
@@ -403,7 +425,11 @@ static void angleControlTask(void *args)
             {
                 motor1.move();
             }
-            downsample_counter = 10;
+            downsample_counter = 5;
+            // 現在の目標角とモーターの角度を表示
+            float roll = motor2.shaftAngle();
+            float pitch = motor1.shaftAngle();
+            ESP_LOGI("angleControlTask", "Roll: %.2f, Pitch: %.2f, Target Roll: %.2f, Target Pitch: %.2f", roll, pitch, local_roll, local_pitch);
         }
         else
         {
@@ -411,6 +437,19 @@ static void angleControlTask(void *args)
             motor2.move();
         }
         // ループ周期 (約1kHz)
+        // 現在のモーター角度を取得
+        float roll_enc = motor2.shaftAngle();
+        float pitch_enc = motor1.shaftAngle();
+
+        // 現在の角度と目標角を共有
+        if (g_motorAnglesMutex && xSemaphoreTake(g_motorAnglesMutex, pdMS_TO_TICKS(1)) == pdTRUE)
+        {
+            g_motorAngles.roll_enc = roll_enc;
+            g_motorAngles.roll_target = local_roll;
+            g_motorAngles.pitch_enc = pitch_enc;
+            g_motorAngles.pitch_target = local_pitch;
+            xSemaphoreGive(g_motorAnglesMutex);
+        }
         vTaskDelay(1);
     }
     vTaskDelete(NULL);
@@ -422,6 +461,7 @@ static void angleControlTask(void *args)
 extern "C" void app_main(void)
 {
     g_angleMutex = xSemaphoreCreateMutex();
+    g_motorAnglesMutex = xSemaphoreCreateMutex(); // 追加
 
     xTaskCreatePinnedToCore(sensorTask, "sensorTask", 4096, NULL, 5, NULL, 1);
     xTaskCreatePinnedToCore(loggingTask, "loggingTask", 4096, NULL, 5, NULL, 1);
