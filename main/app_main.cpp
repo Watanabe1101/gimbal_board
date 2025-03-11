@@ -22,6 +22,33 @@
 
 #include "CanComm.hpp"
 
+// -------------------------
+// モード管理用の定義
+// -------------------------
+enum class OperationMode
+{
+    START,  // 初期化時のモード。CANのみ動作、その他タスクは停止状態
+    LOGGING // 全てのタスクが動作するモード
+};
+
+// グローバルモード変数（初期状態はSTART）
+static volatile OperationMode g_currentMode = OperationMode::START;
+
+// 各タスクのタスクハンドル（タスク管理用）
+static TaskHandle_t sensorTaskHandle = nullptr;
+static TaskHandle_t loggingTaskHandle = nullptr;
+static TaskHandle_t angleControlTaskHandle = nullptr;
+static TaskHandle_t canCommandTaskHandle = nullptr;
+
+// クォータニオンリセット用のフラグ
+static volatile bool g_resetQuaternion = false;
+
+// CANインスタンス作成
+CanComm CAN(BoardID::GIMBAL, GPIO_NUM_14, GPIO_NUM_13);
+
+// -------------------------
+// モーター制御関連
+// -------------------------
 /// @brief ピッチモーターの設定
 BLDCMotor motor1 = BLDCMotor(7);
 BLDCDriver3PWM driver1 = BLDCDriver3PWM(38, 45, 48);
@@ -32,19 +59,7 @@ static BLDCMotor motor2 = BLDCMotor(7); // 同様に7極ペア
 static BLDCDriver3PWM driver2 = BLDCDriver3PWM(10, 11, 12);
 AS5048a sensor2(SPI3_HOST, (gpio_num_t)6, (gpio_num_t)4, (gpio_num_t)15, (gpio_num_t)7);
 
-// CANインスタンス作成
-CanComm CAN(BoardID::GIMBAL, GPIO_NUM_14, GPIO_NUM_13);
-
-#define TIMER_RESOLUTION_HZ (1000 * 1000) // 1MHz
-#define TIMER_ALARM_COUNT (1000)          // 1000ticks = 1ms(=1kHz)
-
-// センサデータをキューでやりとりするための構造体
-typedef struct
-{
-    int16_t sensor[6];
-    uint64_t timestamp_us;
-} sensor_data_t;
-
+// モーター角度データ
 typedef struct
 {
     float roll_enc;     // ロールモーターのエンコーダ値
@@ -52,9 +67,18 @@ typedef struct
     float pitch_enc;    // ピッチモーターのエンコーダ値
     float pitch_target; // ピッチの目標角
 } motor_angles_t;
-
 static motor_angles_t g_motorAngles = {0.0f, 0.0f, 0.0f, 0.0f};
 static SemaphoreHandle_t g_motorAnglesMutex = nullptr;
+
+#define TIMER_RESOLUTION_HZ (1000 * 1000) // 1MHz
+#define TIMER_ALARM_COUNT (1000)          // 1000ticks = 1ms(=1kHz)
+
+// IMUのセンサデータ
+typedef struct
+{
+    int16_t sensor[6];
+    uint64_t timestamp_us;
+} sensor_data_t;
 
 // グローバル変数
 static QueueHandle_t g_sensorQueue = nullptr; // センサー生データ用キュー
@@ -144,24 +168,7 @@ static void sensorTask(void *args)
         return;
     }
 
-    // 5. タイマー開始
-    if (!g_gpt.start())
-    {
-        ESP_LOGE("sensorTask", "Failed to start GPTimer");
-        vTaskDelete(NULL);
-        return;
-    }
-
     ESP_LOGI("sensorTask", "Sensor reading started (1kHz by GPTimer)");
-
-    // 割り込みが動いている間、ここでは特にすることがない
-    // 必要に応じて他の処理を入れてもよい
-    while (true)
-    {
-        // 1秒に1回程度ログを出すなど
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        ESP_LOGD("sensorTask", "Sensor task alive...");
-    }
 
     vTaskDelete(NULL);
 }
@@ -188,8 +195,8 @@ static void loggingTask(void *args)
     // -----------------------------
     // 2-1. キャリブレーション
     // -----------------------------
-    ESP_LOGI("loggingTask", "Start gyro bias calibration for 60sec...");
-    const int sample_count = 1000 * 6; // 60秒
+    ESP_LOGI("loggingTask", "Start gyro bias calibration for 10sec...");
+    const int sample_count = 1000 * 10; // 60秒
     float sumX = 0.0f, sumY = 0.0f, sumZ = 0.0f;
     int countSample = 0;
 
@@ -214,6 +221,8 @@ static void loggingTask(void *args)
     ESP_LOGI("loggingTask", "Calibration done! Gyro bias = (%.2f, %.2f, %.2f)",
              offsetX, offsetY, offsetZ);
 
+    vTaskSuspend(NULL); // ここでタスクを一時停止
+
     // -----------------------------
     // 2-2. 通常ロギング
     // -----------------------------
@@ -226,6 +235,13 @@ static void loggingTask(void *args)
 
     while (true)
     {
+        if (g_resetQuaternion)
+        {
+            ESP_LOGI("loggingTask", "Resetting quaternion as requested");
+            quat.reset();              // クォータニオンをリセット（初期状態に戻す）
+            g_resetQuaternion = false; // リセットフラグをクリア
+        }
+
         sensor_data_t recvData;
         // センサデータを待つ
         if (xQueueReceive(g_sensorQueue, &recvData, portMAX_DELAY) == pdTRUE)
@@ -297,9 +313,6 @@ static void loggingTask(void *args)
             }
         }
     }
-
-    // (実際にタスクが終了する場合はファイルをクローズ)
-    // g_sdCard.end();
     vTaskDelete(NULL);
 }
 
@@ -355,6 +368,7 @@ static void angleControlTask(void *args)
     float roll_prev = 0.0f;      // 前回の角度値（±180°範囲内）
     bool first_update = true;    // 初回更新フラグ
 
+    vTaskSuspend(NULL);
     while (true)
     {
         float local_roll = 0.0f;
@@ -455,18 +469,125 @@ static void angleControlTask(void *args)
     vTaskDelete(NULL);
 }
 
+// -------------------------
+// CANコマンド受信タスク
+// -------------------------
+static void canCommandTask(void *args)
+{
+    ESP_LOGI("canCommandTask", "Starting CAN command task...");
+    CanRxFrame rxFrame;
+
+    while (true)
+    {
+        // 非ブロッキングでCANフレームを取得
+        if (CAN.readFrameNoWait(rxFrame) == ESP_OK)
+        {
+            if (rxFrame.content_id == ContentID::MODE_TRANSITION)
+            {
+                // 受信データの先頭1バイトにコマンド文字が入っている前提
+                char cmd = (char)rxFrame.data[0];
+                ESP_LOGI("canCommandTask", "Received mode command: %c", cmd);
+
+                // コマンドによりモード遷移
+                if (cmd == (char)ModeCommand::LOGGING)
+                {
+                    if (g_currentMode == OperationMode::START)
+                    {
+                        g_currentMode = OperationMode::LOGGING;
+                        // タイマー開始
+                        if (g_gpt.start())
+                        {
+                            ESP_LOGI("canCommandTask", "GPTimer started");
+                        }
+                        else
+                        {
+                            ESP_LOGE("canCommandTask", "Failed to start GPTimer");
+                        }
+                        // 各タスクを再開（vTaskResumeを使用）
+                        ESP_LOGI("canCommandTask", "Resuming all tasks");
+                        if (loggingTaskHandle != nullptr)
+                        {
+                            vTaskResume(loggingTaskHandle);
+                        }
+                        if (angleControlTaskHandle != nullptr)
+                        {
+                            vTaskResume(angleControlTaskHandle);
+                        }
+
+                        ESP_LOGI("canCommandTask", "Mode transition: START -> LOGGING");
+                    }
+                }
+                else if (cmd == (char)ModeCommand::START)
+                {
+                    if (g_currentMode == OperationMode::LOGGING)
+                    {
+                        g_currentMode = OperationMode::START;
+                        // タイマー停止
+                        if (g_gpt.stop())
+                        {
+                            ESP_LOGI("canCommandTask", "GPTimer stopped");
+                        }
+                        else
+                        {
+                            ESP_LOGE("canCommandTask", "Failed to stop GPTimer");
+                        }
+                        // 次回起動時にクォータニオンをリセットするよう設定
+                        g_resetQuaternion = true;
+                        ESP_LOGI("canCommandTask", "Quaternion reset flag set for next startup");
+
+                        // 各タスクを一時停止（vTaskSuspendを使用）
+                        ESP_LOGI("canCommandTask", "Suspending all tasks");
+
+                        if (angleControlTaskHandle != nullptr)
+                        {
+                            vTaskSuspend(angleControlTaskHandle);
+                        }
+                        if (loggingTaskHandle != nullptr)
+                        {
+                            vTaskSuspend(loggingTaskHandle);
+                        }
+
+                        ESP_LOGI("canCommandTask", "Mode transition: LOGGING -> START");
+                    }
+                }
+                else
+                {
+                    ESP_LOGW("canCommandTask", "Unknown mode command received: %c", cmd);
+                }
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(100)); // 少し待ってループ（busy loop回避）
+    }
+    vTaskDelete(NULL);
+}
+
 // -----------------------------
 // メイン (タスク生成)
 // -----------------------------
 extern "C" void app_main(void)
 {
-    g_angleMutex = xSemaphoreCreateMutex();
-    g_motorAnglesMutex = xSemaphoreCreateMutex(); // 追加
+    ESP_LOGI("app_main", "System starting in START mode...");
 
-    xTaskCreatePinnedToCore(sensorTask, "sensorTask", 4096, NULL, 5, NULL, 1);
-    xTaskCreatePinnedToCore(loggingTask, "loggingTask", 4096, NULL, 5, NULL, 1);
-    xTaskCreatePinnedToCore(angleControlTask, "angleControlTask", 8192, NULL, 6, NULL, 0);
-    while (1)
+    // 共有データ用ミューテックス生成
+    g_angleMutex = xSemaphoreCreateMutex();
+    g_motorAnglesMutex = xSemaphoreCreateMutex();
+
+    // CANドライバ初期化
+    if (CAN.begin() != ESP_OK)
+    {
+        ESP_LOGE("app_main", "CAN begin failed");
+        return;
+    }
+
+    // CANコマンド受信用タスクを生成（常時動作）
+    xTaskCreatePinnedToCore(canCommandTask, "canCommandTask", 4096, NULL, 6, &canCommandTaskHandle, 1);
+
+    // 各タスクを生成（初期化処理のみ実行後、自身を一時停止する）
+    xTaskCreatePinnedToCore(sensorTask, "sensorTask", 4096, NULL, 5, &sensorTaskHandle, 1);
+    xTaskCreatePinnedToCore(loggingTask, "loggingTask", 4096, NULL, 5, &loggingTaskHandle, 1);
+    xTaskCreatePinnedToCore(angleControlTask, "angleControlTask", 8192, NULL, 6, &angleControlTaskHandle, 0);
+
+    while (true)
     {
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
