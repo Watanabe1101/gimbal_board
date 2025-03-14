@@ -102,6 +102,11 @@ static bool IRAM_ATTR sensorTimerCallback(gptimer_handle_t timer,
                                           const gptimer_alarm_event_data_t *edata,
                                           void *user_ctx)
 {
+    if (loggingTaskHandle != nullptr && eTaskGetState(loggingTaskHandle) == eSuspended)
+    {
+        // タスクがサスペンド状態の場合は何もせずに戻る
+        return false;
+    }
     // IMUからセンサ値を取得
     sensor_data_t sdata;
     int16_t sensor[6] = {0};
@@ -168,7 +173,24 @@ static void sensorTask(void *args)
         return;
     }
 
+    // 5. タイマー開始
+    if (!g_gpt.start())
+    {
+        ESP_LOGE("sensorTask", "Failed to start GPTimer");
+        vTaskDelete(NULL);
+        return;
+    }
+
     ESP_LOGI("sensorTask", "Sensor reading started (1kHz by GPTimer)");
+
+    // 割り込みが動いている間、ここでは特にすることがない
+    // 必要に応じて他の処理を入れてもよい
+    while (true)
+    {
+        // 1秒に1回程度ログを出すなど
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        ESP_LOGD("sensorTask", "Sensor task alive...");
+    }
 
     vTaskDelete(NULL);
 }
@@ -330,25 +352,25 @@ static void angleControlTask(void *args)
     // 1. ドライバ初期化 & モータ設定
     sensor1.init();
     motor1.linkSensor(&sensor1);
-    driver1.voltage_power_supply = 12;
-    driver1.voltage_limit = 6;
+    driver1.voltage_power_supply = 14;
+    driver1.voltage_limit = 7;
     driver1.init(0); // MCPWMユニット0
     motor1.linkDriver(&driver1);
     motor1.controller = MotionControlType::angle;
     motor1.velocity_limit = 100.0; // [rad/s]上限
-    motor1.voltage_limit = 4.0;
+    motor1.voltage_limit = 7.0;
     motor1.init();
     motor1.initFOC();
 
-    driver2.voltage_power_supply = 12;
-    driver2.voltage_limit = 6;
+    driver2.voltage_power_supply = 14;
+    driver2.voltage_limit = 7;
     driver2.init(1); // MCPWMユニット1
     sensor2.init();
     motor2.linkSensor(&sensor2);
     motor2.linkDriver(&driver2);
     motor2.controller = MotionControlType::angle;
     motor2.velocity_limit = 100.0;
-    motor2.voltage_limit = 6.0;
+    motor2.voltage_limit = 7.0;
     motor2.init();
     motor2.initFOC();
 
@@ -459,9 +481,9 @@ static void angleControlTask(void *args)
         if (g_motorAnglesMutex && xSemaphoreTake(g_motorAnglesMutex, pdMS_TO_TICKS(1)) == pdTRUE)
         {
             g_motorAngles.roll_enc = roll_enc;
-            g_motorAngles.roll_target = local_roll;
+            g_motorAngles.roll_target = local_roll + initial_roll;
             g_motorAngles.pitch_enc = pitch_enc;
-            g_motorAngles.pitch_target = local_pitch;
+            g_motorAngles.pitch_target = local_pitch + initial_pitch;
             xSemaphoreGive(g_motorAnglesMutex);
         }
         vTaskDelay(1);
@@ -474,6 +496,13 @@ static void angleControlTask(void *args)
 // -------------------------
 static void canCommandTask(void *args)
 {
+    // CANドライバ初期化
+    if (CAN.begin() != ESP_OK)
+    {
+        ESP_LOGE("app_main", "CAN begin failed");
+        return;
+    }
+
     ESP_LOGI("canCommandTask", "Starting CAN command task...");
     CanRxFrame rxFrame;
 
@@ -494,15 +523,6 @@ static void canCommandTask(void *args)
                     if (g_currentMode == OperationMode::START)
                     {
                         g_currentMode = OperationMode::LOGGING;
-                        // タイマー開始
-                        if (g_gpt.start())
-                        {
-                            ESP_LOGI("canCommandTask", "GPTimer started");
-                        }
-                        else
-                        {
-                            ESP_LOGE("canCommandTask", "Failed to start GPTimer");
-                        }
                         // 各タスクを再開（vTaskResumeを使用）
                         ESP_LOGI("canCommandTask", "Resuming all tasks");
                         if (loggingTaskHandle != nullptr)
@@ -521,15 +541,6 @@ static void canCommandTask(void *args)
                     if (g_currentMode == OperationMode::LOGGING)
                     {
                         g_currentMode = OperationMode::START;
-                        // タイマー停止
-                        if (g_gpt.stop())
-                        {
-                            ESP_LOGI("canCommandTask", "GPTimer stopped");
-                        }
-                        else
-                        {
-                            ESP_LOGE("canCommandTask", "Failed to stop GPTimer");
-                        }
                         // 次回起動時にクォータニオンをリセットするよう設定
                         g_resetQuaternion = true;
                         ESP_LOGI("canCommandTask", "Quaternion reset flag set for next startup");
@@ -571,17 +582,7 @@ extern "C" void app_main(void)
     g_angleMutex = xSemaphoreCreateMutex();
     g_motorAnglesMutex = xSemaphoreCreateMutex();
 
-    // CANドライバ初期化
-    if (CAN.begin() != ESP_OK)
-    {
-        ESP_LOGE("app_main", "CAN begin failed");
-        return;
-    }
-
-    // CANコマンド受信用タスクを生成（常時動作）
     xTaskCreatePinnedToCore(canCommandTask, "canCommandTask", 4096, NULL, 6, &canCommandTaskHandle, 1);
-
-    // 各タスクを生成（初期化処理のみ実行後、自身を一時停止する）
     xTaskCreatePinnedToCore(sensorTask, "sensorTask", 4096, NULL, 5, &sensorTaskHandle, 1);
     xTaskCreatePinnedToCore(loggingTask, "loggingTask", 4096, NULL, 5, &loggingTaskHandle, 1);
     xTaskCreatePinnedToCore(angleControlTask, "angleControlTask", 8192, NULL, 6, &angleControlTaskHandle, 0);
