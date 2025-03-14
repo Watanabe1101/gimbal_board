@@ -513,7 +513,6 @@ static void canCommandTask(void *args)
                         {
                             vTaskResume(angleControlTaskHandle);
                         }
-
                         ESP_LOGI("canCommandTask", "Mode transition: START -> LOGGING");
                     }
                 }
