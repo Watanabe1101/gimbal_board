@@ -346,8 +346,8 @@ static void angleControlTask(void *args)
 {
 
     // モーター初期位置(組み立て依存)
-    float initial_roll = -0.2f;
-    float initial_pitch = 2.05f;
+    float initial_roll = -0.79f;
+    float initial_pitch = -1.8f + (20 * PI / 180);
 
     // 1. ドライバ初期化 & モータ設定
     sensor1.init();
@@ -359,6 +359,9 @@ static void angleControlTask(void *args)
     motor1.controller = MotionControlType::angle;
     motor1.velocity_limit = 100.0; // [rad/s]上限
     motor1.voltage_limit = 7.0;
+    motor1.PID_velocity.P = 0.2;
+    motor1.PID_velocity.I = 20;
+    motor1.PID_velocity.D = 0.001;
     motor1.init();
     motor1.initFOC();
 
@@ -378,6 +381,8 @@ static void angleControlTask(void *args)
 
     motor1.move(initial_pitch);
     motor2.move(initial_roll);
+    motor1.loopFOC();
+    motor2.loopFOC();
 
     // 角度更新のダウンサンプリング
     int16_t downsample_counter = 1;
@@ -461,11 +466,11 @@ static void angleControlTask(void *args)
             {
                 motor1.move();
             }
-            downsample_counter = 5;
+            downsample_counter = 2;
             // 現在の目標角とモーターの角度を表示
             float roll = motor2.shaftAngle();
             float pitch = motor1.shaftAngle();
-            ESP_LOGI("angleControlTask", "Roll: %.2f, Pitch: %.2f, Target Roll: %.2f, Target Pitch: %.2f", roll, pitch, local_roll, local_pitch);
+            // ESP_LOGI("angleControlTask", "Roll: %.2f, Pitch: %.2f, Target Roll: %.2f, Target Pitch: %.2f", roll, pitch, local_roll, local_pitch);
         }
         else
         {
@@ -591,4 +596,47 @@ extern "C" void app_main(void)
     {
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
+
+    // // モーター初期位置(組み立て依存)
+    // float initial_roll = -0.79f;
+    // float initial_pitch = -1.8f + (20 * PI / 180);
+
+    // // 1. ドライバ初期化 & モータ設定
+    // sensor1.init();
+    // motor1.linkSensor(&sensor1);
+    // driver1.voltage_power_supply = 14;
+    // driver1.voltage_limit = 7;
+    // driver1.init(0); // MCPWMユニット0
+    // motor1.linkDriver(&driver1);
+    // motor1.controller = MotionControlType::angle;
+    // motor1.velocity_limit = 100.0; // [rad/s]上限
+    // motor1.voltage_limit = 7.0;
+    // motor1.PID_velocity.P = 0.2;
+    // motor1.PID_velocity.I = 20;
+    // motor1.PID_velocity.D = 0.001;
+    // motor1.init();
+    // motor1.initFOC();
+
+    // driver2.voltage_power_supply = 14;
+    // driver2.voltage_limit = 7;
+    // driver2.init(1); // MCPWMユニット1
+    // sensor2.init();
+    // motor2.linkSensor(&sensor2);
+    // motor2.linkDriver(&driver2);
+    // motor2.controller = MotionControlType::angle;
+    // motor2.velocity_limit = 100.0;
+    // motor2.voltage_limit = 7.0;
+    // motor2.init();
+    // motor2.initFOC();
+
+    // ESP_LOGI("angleControlTask", "Motors initialized (open-loop angle).");
+
+    // while (true)
+    // {
+    //     motor1.move(initial_pitch);
+    //     motor1.loopFOC();
+    //     motor2.move(initial_roll);
+    //     motor2.loopFOC();
+    //     vTaskDelay(pdMS_TO_TICKS(1));
+    // }
 }
